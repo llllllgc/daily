@@ -3,6 +3,17 @@ import 'package:daily/models.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('exact alarm permission selects exact Android scheduling', () {
+    expect(
+      androidScheduleModeForExactAlarmPermission(true).name,
+      'exactAllowWhileIdle',
+    );
+    expect(
+      androidScheduleModeForExactAlarmPermission(false).name,
+      'inexactAllowWhileIdle',
+    );
+  });
+
   test('test notification payload round-trips action data', () {
     final payload = NotificationPayload(
       itemId: -1,
@@ -86,5 +97,69 @@ void main() {
 
     expect(completed, isFalse);
     expect(await store.completionCount(), 0);
+  });
+
+  test('schedule plan is not truncated at the old 96 notification limit', () {
+    final start = DateTime(2026, 10, 20);
+    final item = ReminderItem(
+      id: 7,
+      title: '多次用药',
+      iconKey: 'medication',
+      startDate: start,
+      repeatKind: RepeatKind.daily,
+      times: [
+        for (var index = 0; index < 12; index++)
+          ReminderTime(
+            id: 100 + index,
+            itemId: 7,
+            minuteOfDay: (8 + index) * 60,
+            sortOrder: index,
+          ),
+      ],
+    );
+
+    final plan = buildNotificationSchedulePlan(
+      items: [item],
+      now: DateTime(2026, 10, 20, 7),
+    );
+
+    expect(plan.length, greaterThan(96));
+    expect(
+      plan.any(
+        (entry) =>
+            dayKey(entry.date) == dayKey(start.add(const Duration(days: 34))),
+      ),
+      isTrue,
+    );
+  });
+
+  test('schedule reconciliation preserves snoozed notifications', () {
+    final date = DateTime(2026, 10, 20);
+    final scheduled = NotificationPayload(
+      itemId: 1,
+      reminderTimeId: 2,
+      date: date,
+      title: '维生素 D',
+      timeLabel: '09:00',
+      kind: NotificationKind.scheduled,
+    );
+    final snoozed = NotificationPayload(
+      itemId: 1,
+      reminderTimeId: 2,
+      date: date,
+      title: '维生素 D',
+      timeLabel: '09:00',
+      kind: NotificationKind.snoozed,
+    );
+
+    final obsolete = obsoleteManagedNotificationIds(
+      pending: [
+        PendingNotificationSnapshot(id: 10, payload: scheduled.encode()),
+        PendingNotificationSnapshot(id: 11, payload: snoozed.encode()),
+      ],
+      desiredIds: const <int>{},
+    );
+
+    expect(obsolete, {10});
   });
 }

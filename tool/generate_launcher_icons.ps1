@@ -52,6 +52,11 @@ function New-LauncherIcon {
     )
     $graphics.FillPath($backgroundBrush, $backgroundPath)
 
+    $markState = $graphics.Save()
+    $graphics.TranslateTransform(54 * $scale, 54 * $scale)
+    $graphics.ScaleTransform(0.78, 0.78)
+    $graphics.TranslateTransform(-54 * $scale, -54 * $scale)
+
     $calendarPath = [System.Drawing.Drawing2D.GraphicsPath]::new()
     Add-RoundedRectangle -Path $calendarPath -Bounds ([System.Drawing.RectangleF]::new(
         25 * $scale,
@@ -78,6 +83,7 @@ function New-LauncherIcon {
         18 * $scale,
         18 * $scale
     )
+    $graphics.Restore($markState)
 
     $output = [System.Drawing.Bitmap]::new(
         $Size,

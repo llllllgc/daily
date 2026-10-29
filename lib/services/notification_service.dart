@@ -21,10 +21,101 @@ const _cycleChannel = 'daily_cycle_alerts';
 const _notificationActionPortName = 'daily.notification_action_refresh';
 const _completionChangedMessage = 'completion_changed';
 const _deviceSettingsChannel = MethodChannel('daily/device_settings');
+const notificationSchedulingHorizonDays = 35;
+const notificationSchedulingLimit = 450;
+
+AndroidScheduleMode androidScheduleModeForExactAlarmPermission(
+  bool exactAlarmAllowed,
+) => exactAlarmAllowed
+    ? AndroidScheduleMode.exactAllowWhileIdle
+    : AndroidScheduleMode.inexactAllowWhileIdle;
+
+enum NotificationKind { scheduled, snoozed, cycle, test }
+
+class PlannedReminder {
+  const PlannedReminder({
+    required this.item,
+    required this.time,
+    required this.date,
+    required this.scheduledAt,
+  });
+
+  final ReminderItem item;
+  final ReminderTime time;
+  final DateTime date;
+  final DateTime scheduledAt;
+
+  int get notificationId =>
+      NotificationService._notificationId(item.id!, time.id!, date);
+}
+
+class PendingNotificationSnapshot {
+  const PendingNotificationSnapshot({required this.id, this.payload});
+
+  final int id;
+  final String? payload;
+}
+
+List<PlannedReminder> buildNotificationSchedulePlan({
+  required List<ReminderItem> items,
+  required DateTime now,
+  int horizonDays = notificationSchedulingHorizonDays,
+  int limit = notificationSchedulingLimit,
+}) {
+  final firstDay = dateOnly(now);
+  final plan = <PlannedReminder>[];
+  for (var offset = 0; offset < horizonDays; offset++) {
+    final date = firstDay.add(Duration(days: offset));
+    for (final item in items.where((entry) => entry.isScheduledOn(date))) {
+      if (item.id == null) continue;
+      for (final time in item.times) {
+        if (time.id == null) continue;
+        final scheduledAt = DateTime(
+          date.year,
+          date.month,
+          date.day,
+          time.hour,
+          time.minute,
+        );
+        if (!scheduledAt.isAfter(now.add(const Duration(seconds: 5)))) {
+          continue;
+        }
+        plan.add(
+          PlannedReminder(
+            item: item,
+            time: time,
+            date: date,
+            scheduledAt: scheduledAt,
+          ),
+        );
+      }
+    }
+  }
+  plan.sort((a, b) => a.scheduledAt.compareTo(b.scheduledAt));
+  return plan.take(limit).toList(growable: false);
+}
+
+Set<int> obsoleteManagedNotificationIds({
+  required List<PendingNotificationSnapshot> pending,
+  required Set<int> desiredIds,
+}) {
+  final result = <int>{};
+  for (final request in pending) {
+    final payload = NotificationPayload.decode(request.payload);
+    if (payload == null ||
+        payload.kind == NotificationKind.snoozed ||
+        payload.kind == NotificationKind.test) {
+      continue;
+    }
+    if (!desiredIds.contains(request.id)) result.add(request.id);
+  }
+  return result;
+}
 
 class ReminderHealth {
   const ReminderHealth({
     required this.notificationsEnabled,
+    required this.exactAlarmAllowed,
     required this.reminderChannelEnabled,
     required this.reminderChannelCanPopUp,
     required this.batteryOptimizationIgnored,
@@ -33,6 +124,7 @@ class ReminderHealth {
   });
 
   final bool notificationsEnabled;
+  final bool exactAlarmAllowed;
   final bool reminderChannelEnabled;
   final bool reminderChannelCanPopUp;
   final bool batteryOptimizationIgnored;
@@ -43,6 +135,7 @@ class ReminderHealth {
 abstract class ReminderScheduler {
   Future<void> initialize();
   Future<bool> requestPermission();
+  Future<bool> requestExactAlarmPermission();
   Future<bool> areNotificationsEnabled();
   Future<ReminderHealth> health();
   Future<void> openNotificationSettings();
@@ -61,11 +154,15 @@ class NoopReminderScheduler implements ReminderScheduler {
   Future<bool> requestPermission() async => true;
 
   @override
+  Future<bool> requestExactAlarmPermission() async => true;
+
+  @override
   Future<bool> areNotificationsEnabled() async => true;
 
   @override
   Future<ReminderHealth> health() async => const ReminderHealth(
     notificationsEnabled: true,
+    exactAlarmAllowed: true,
     reminderChannelEnabled: true,
     reminderChannelCanPopUp: true,
     batteryOptimizationIgnored: true,
@@ -93,6 +190,7 @@ class NotificationPayload {
     required this.title,
     required this.timeLabel,
     this.snoozeMinutes,
+    this.kind = NotificationKind.scheduled,
     this.isTest = false,
   });
 
@@ -102,6 +200,7 @@ class NotificationPayload {
   final String title;
   final String timeLabel;
   final int? snoozeMinutes;
+  final NotificationKind kind;
   final bool isTest;
 
   String encode() => jsonEncode(<String, Object?>{
@@ -111,6 +210,7 @@ class NotificationPayload {
     'title': title,
     'timeLabel': timeLabel,
     'snoozeMinutes': snoozeMinutes,
+    'kind': kind.name,
     'isTest': isTest,
   });
 
@@ -118,6 +218,11 @@ class NotificationPayload {
     if (value == null || value.isEmpty) return null;
     try {
       final map = jsonDecode(value) as Map<String, dynamic>;
+      final isTest = map['isTest'] as bool? ?? false;
+      final kindName = map['kind'] as String?;
+      final kind = NotificationKind.values.where(
+        (entry) => entry.name == kindName,
+      );
       return NotificationPayload(
         itemId: map['itemId'] as int,
         reminderTimeId: map['reminderTimeId'] as int,
@@ -125,7 +230,10 @@ class NotificationPayload {
         title: map['title'] as String,
         timeLabel: map['timeLabel'] as String,
         snoozeMinutes: map['snoozeMinutes'] as int?,
-        isTest: map['isTest'] as bool? ?? false,
+        kind: kind.isEmpty
+            ? (isTest ? NotificationKind.test : NotificationKind.scheduled)
+            : kind.first,
+        isTest: isTest,
       );
     } on Object {
       return null;
@@ -307,6 +415,18 @@ class NotificationService implements ReminderScheduler {
   }
 
   @override
+  Future<bool> requestExactAlarmPermission() async {
+    if (kIsWeb || !Platform.isAndroid) return true;
+    await initialize();
+    return await _plugin
+            .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin
+            >()
+            ?.requestExactAlarmsPermission() ??
+        false;
+  }
+
+  @override
   Future<bool> areNotificationsEnabled() async {
     if (kIsWeb || !Platform.isAndroid) return true;
     await initialize();
@@ -323,6 +443,7 @@ class NotificationService implements ReminderScheduler {
     if (kIsWeb || !Platform.isAndroid) {
       return ReminderHealth(
         notificationsEnabled: true,
+        exactAlarmAllowed: true,
         reminderChannelEnabled: true,
         reminderChannelCanPopUp: true,
         batteryOptimizationIgnored: true,
@@ -337,6 +458,8 @@ class NotificationService implements ReminderScheduler {
         >();
     final notificationsEnabled =
         await android?.areNotificationsEnabled() ?? false;
+    final exactAlarmAllowed =
+        await android?.canScheduleExactNotifications() ?? false;
     final channels = await android?.getNotificationChannels() ?? const [];
     AndroidNotificationChannel? reminderChannel;
     for (final channel in channels) {
@@ -359,6 +482,7 @@ class NotificationService implements ReminderScheduler {
     final importance = reminderChannel?.importance.value ?? 0;
     return ReminderHealth(
       notificationsEnabled: notificationsEnabled,
+      exactAlarmAllowed: exactAlarmAllowed,
       reminderChannelEnabled: reminderChannel != null && importance > 0,
       reminderChannelCanPopUp: importance >= Importance.high.value,
       batteryOptimizationIgnored: batteryOptimizationIgnored,
@@ -392,96 +516,144 @@ class NotificationService implements ReminderScheduler {
   Future<void> sync(List<ReminderItem> items) async {
     if (kIsWeb || !Platform.isAndroid) return;
     await initialize();
-    await _plugin.cancelAll();
-
     final now = tz.TZDateTime.now(tz.local);
-    final firstDay = DateTime(now.year, now.month, now.day);
-    var scheduledCount = 0;
-    for (var offset = 0; offset <= 30 && scheduledCount < 96; offset++) {
-      final date = firstDay.add(Duration(days: offset));
-      for (final item in items.where((entry) => entry.isScheduledOn(date))) {
-        final itemId = item.id;
-        if (itemId == null) continue;
-        for (final time in item.times) {
-          final timeId = time.id;
-          if (timeId == null) continue;
-          final scheduledDate = tz.TZDateTime(
-            tz.local,
-            date.year,
-            date.month,
-            date.day,
-            time.hour,
-            time.minute,
-          );
-          if (!scheduledDate.isAfter(now.add(const Duration(seconds: 5)))) {
-            continue;
-          }
-          final payload = NotificationPayload(
-            itemId: itemId,
-            reminderTimeId: timeId,
-            date: date,
-            title: item.title,
-            timeLabel: time.label,
-            snoozeMinutes: item.snoozeMinutes,
-          );
-          await _plugin.zonedSchedule(
-            id: _notificationId(itemId, timeId, date),
-            title: item.title,
-            body: item.times.length == 1
-                ? '现在可以完成这件事了'
-                : '第 ${time.sortOrder + 1} 次 · ${time.label}',
-            scheduledDate: scheduledDate,
-            notificationDetails: _reminderDetails(
-              allowSnooze: item.snoozeMinutes != null,
-            ),
-            androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-            payload: payload.encode(),
-          );
-          scheduledCount++;
-          if (scheduledCount >= 96) break;
-        }
-        if (scheduledCount >= 96) break;
-      }
+    final android = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    final exactAlarmAllowed =
+        await android?.canScheduleExactNotifications() ?? false;
+    final androidScheduleMode = androidScheduleModeForExactAlarmPermission(
+      exactAlarmAllowed,
+    );
+    final localNow = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      now.hour,
+      now.minute,
+      now.second,
+    );
+    final cyclePlan = _buildCycleAlertPlan(items, now);
+    final reminderLimit = (notificationSchedulingLimit - cyclePlan.length)
+        .clamp(0, notificationSchedulingLimit);
+    final reminderPlan = buildNotificationSchedulePlan(
+      items: items,
+      now: localNow,
+      limit: reminderLimit,
+    );
+    final desiredIds = <int>{
+      ...reminderPlan.map((entry) => entry.notificationId),
+      ...cyclePlan.map((entry) => entry.id),
+    };
+    final pending = await _plugin.pendingNotificationRequests();
+    final obsoleteIds = obsoleteManagedNotificationIds(
+      pending: [
+        for (final request in pending)
+          PendingNotificationSnapshot(id: request.id, payload: request.payload),
+      ],
+      desiredIds: desiredIds,
+    );
+    for (final id in obsoleteIds) {
+      await _plugin.cancel(id: id);
     }
 
-    for (final item in items) {
-      await _scheduleCycleAlerts(item, now);
+    for (final entry in reminderPlan) {
+      final item = entry.item;
+      final time = entry.time;
+      final scheduledDate = tz.TZDateTime(
+        tz.local,
+        entry.date.year,
+        entry.date.month,
+        entry.date.day,
+        time.hour,
+        time.minute,
+      );
+      final payload = NotificationPayload(
+        itemId: item.id!,
+        reminderTimeId: time.id!,
+        date: entry.date,
+        title: item.title,
+        timeLabel: time.label,
+        snoozeMinutes: item.snoozeMinutes,
+      );
+      await _plugin.zonedSchedule(
+        id: entry.notificationId,
+        title: item.title,
+        body: item.times.length == 1
+            ? '现在可以完成这件事了'
+            : '第 ${time.sortOrder + 1} 次 · ${time.label}',
+        scheduledDate: scheduledDate,
+        notificationDetails: _reminderDetails(
+          allowSnooze: item.snoozeMinutes != null,
+        ),
+        androidScheduleMode: androidScheduleMode,
+        payload: payload.encode(),
+      );
+    }
+
+    for (final entry in cyclePlan) {
+      await _plugin.zonedSchedule(
+        id: entry.id,
+        title: entry.item.title,
+        body: '${entry.label} · 只作提醒，不会替你更改事项',
+        scheduledDate: entry.scheduledDate,
+        notificationDetails: _cycleDetails,
+        androidScheduleMode: androidScheduleMode,
+        payload: NotificationPayload(
+          itemId: entry.item.id!,
+          reminderTimeId: -1,
+          date: entry.scheduledDate,
+          title: entry.item.title,
+          timeLabel: '09:00',
+          kind: NotificationKind.cycle,
+        ).encode(),
+      );
     }
     _lastSyncedAt = DateTime.now();
   }
 
-  Future<void> _scheduleCycleAlerts(
-    ReminderItem item,
-    tz.TZDateTime now,
-  ) async {
-    final end = item.endDate;
-    final itemId = item.id;
-    if (end == null || itemId == null) return;
-    final alerts = <(DateTime, String, int)>[];
-    if (item.alertMonthBefore) {
-      alerts.add((_monthBefore(end), '还有一个月结束', 31));
+  List<({int id, ReminderItem item, String label, tz.TZDateTime scheduledDate})>
+  _buildCycleAlertPlan(List<ReminderItem> items, tz.TZDateTime now) {
+    final plan =
+        <
+          ({
+            int id,
+            ReminderItem item,
+            String label,
+            tz.TZDateTime scheduledDate,
+          })
+        >[];
+    for (final item in items) {
+      final end = item.endDate;
+      final itemId = item.id;
+      if (end == null || itemId == null) continue;
+      final alerts = <(DateTime, String, int)>[];
+      if (item.alertMonthBefore) {
+        alerts.add((_monthBefore(end), '还有一个月结束', 31));
+      }
+      if (item.alertWeekBefore) {
+        alerts.add((end.subtract(const Duration(days: 7)), '还有一周结束', 7));
+      }
+      for (final (date, label, salt) in alerts) {
+        final scheduledDate = tz.TZDateTime(
+          tz.local,
+          date.year,
+          date.month,
+          date.day,
+          9,
+        );
+        if (!scheduledDate.isAfter(now)) continue;
+        plan.add((
+          id: _cycleNotificationId(itemId, salt),
+          item: item,
+          label: label,
+          scheduledDate: scheduledDate,
+        ));
+      }
     }
-    if (item.alertWeekBefore) {
-      alerts.add((end.subtract(const Duration(days: 7)), '还有一周结束', 7));
-    }
-    for (final (date, label, salt) in alerts) {
-      final scheduledDate = tz.TZDateTime(
-        tz.local,
-        date.year,
-        date.month,
-        date.day,
-        9,
-      );
-      if (!scheduledDate.isAfter(now)) continue;
-      await _plugin.zonedSchedule(
-        id: _cycleNotificationId(itemId, salt),
-        title: item.title,
-        body: '$label · 只作提醒，不会替你更改事项',
-        scheduledDate: scheduledDate,
-        notificationDetails: _cycleDetails,
-        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-      );
-    }
+    plan.sort((a, b) => a.scheduledDate.compareTo(b.scheduledDate));
+    return plan.take(notificationSchedulingLimit).toList(growable: false);
   }
 
   @override
@@ -497,6 +669,7 @@ class NotificationService implements ReminderScheduler {
       timeLabel:
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
       snoozeMinutes: 1,
+      kind: NotificationKind.test,
       isTest: true,
     );
     await _plugin.show(
@@ -513,17 +686,37 @@ class NotificationService implements ReminderScheduler {
     await _configureTimezone();
     final plugin = FlutterLocalNotificationsPlugin();
     await plugin.initialize(settings: _initializationSettings);
+    final android = plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    final exactAlarmAllowed =
+        await android?.canScheduleExactNotifications() ?? false;
     final when = tz.TZDateTime.now(
       tz.local,
     ).add(Duration(minutes: payload.snoozeMinutes!));
+    final snoozedPayload = NotificationPayload(
+      itemId: payload.itemId,
+      reminderTimeId: payload.reminderTimeId,
+      date: payload.date,
+      title: payload.title,
+      timeLabel: payload.timeLabel,
+      snoozeMinutes: payload.snoozeMinutes,
+      kind: NotificationKind.snoozed,
+      isTest: payload.isTest,
+    );
     await plugin.zonedSchedule(
-      id: DateTime.now().millisecondsSinceEpoch.remainder(2147000000),
+      id:
+          1800000000 +
+          DateTime.now().millisecondsSinceEpoch.remainder(100000000),
       title: payload.title,
       body: '稍后提醒 · ${payload.timeLabel}',
       scheduledDate: when,
       notificationDetails: _reminderDetails(allowSnooze: true),
-      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-      payload: payload.encode(),
+      androidScheduleMode: androidScheduleModeForExactAlarmPermission(
+        exactAlarmAllowed,
+      ),
+      payload: snoozedPayload.encode(),
     );
   }
 
@@ -539,13 +732,12 @@ class NotificationService implements ReminderScheduler {
 
   static int _notificationId(int itemId, int timeId, DateTime date) {
     final dateNumber = date.year * 10000 + date.month * 100 + date.day;
-    return (itemId * 1000003 + timeId * 9176 + dateNumber).remainder(
-      2147000000,
-    );
+    return 1 +
+        (itemId * 1000003 + timeId * 9176 + dateNumber).remainder(1499999998);
   }
 
   static int _cycleNotificationId(int itemId, int salt) =>
-      (2000000000 + itemId * 37 + salt).remainder(2147000000);
+      1600000000 + (itemId * 37 + salt).remainder(100000000);
 
   static DateTime _monthBefore(DateTime date) {
     final previousMonth = date.month == 1 ? 12 : date.month - 1;

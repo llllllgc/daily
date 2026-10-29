@@ -1,6 +1,6 @@
 import 'dart:async';
 
-enum RepeatKind { daily, weekly }
+enum RepeatKind { daily, weekly, interval }
 
 enum DayRecordStatus { none, pending, partial, complete, missed }
 
@@ -79,8 +79,16 @@ class ReminderItem {
     required this.startDate,
     this.endDate,
     required this.repeatKind,
+    this.intervalDays = 2,
     this.weekdays = const <int>{},
     required this.times,
+    this.stockQuantity,
+    this.doseQuantity = 1,
+    this.stockUnit = '片',
+    this.productionDate,
+    this.expiryDate,
+    this.usedQuantityBase = 0,
+    this.usedQuantity = 0,
     this.snoozeMinutes,
     this.alertMonthBefore = true,
     this.alertWeekBefore = true,
@@ -94,8 +102,20 @@ class ReminderItem {
   final DateTime startDate;
   final DateTime? endDate;
   final RepeatKind repeatKind;
+  final int intervalDays;
   final Set<int> weekdays;
   final List<ReminderTime> times;
+  final double? stockQuantity;
+  final double doseQuantity;
+  final String stockUnit;
+  final DateTime? productionDate;
+  final DateTime? expiryDate;
+  final double usedQuantityBase;
+  final double usedQuantity;
+
+  double? get remainingQuantity => stockQuantity == null
+      ? null
+      : ((stockQuantity! - usedQuantity) * 100).round() / 100;
   final int? snoozeMinutes;
   final bool alertMonthBefore;
   final bool alertWeekBefore;
@@ -112,11 +132,24 @@ class ReminderItem {
     return switch (repeatKind) {
       RepeatKind.daily => true,
       RepeatKind.weekly => weekdays.contains(day.weekday),
+      RepeatKind.interval =>
+        (DateTime.utc(day.year, day.month, day.day)
+                    .difference(
+                      DateTime.utc(
+                        startDate.year,
+                        startDate.month,
+                        startDate.day,
+                      ),
+                    )
+                    .inDays %
+                intervalDays) ==
+            0,
     };
   }
 
   String get scheduleLabel {
     if (repeatKind == RepeatKind.daily) return '每天';
+    if (repeatKind == RepeatKind.interval) return '每 $intervalDays 天';
     const labels = <int, String>{
       1: '周一',
       2: '周二',
@@ -138,8 +171,19 @@ class ReminderItem {
     DateTime? endDate,
     bool clearEndDate = false,
     RepeatKind? repeatKind,
+    int? intervalDays,
     Set<int>? weekdays,
     List<ReminderTime>? times,
+    double? stockQuantity,
+    bool clearStockQuantity = false,
+    double? doseQuantity,
+    String? stockUnit,
+    DateTime? productionDate,
+    bool clearProductionDate = false,
+    DateTime? expiryDate,
+    bool clearExpiryDate = false,
+    double? usedQuantityBase,
+    double? usedQuantity,
     int? snoozeMinutes,
     bool clearSnooze = false,
     bool? alertMonthBefore,
@@ -154,8 +198,20 @@ class ReminderItem {
       startDate: startDate ?? this.startDate,
       endDate: clearEndDate ? null : (endDate ?? this.endDate),
       repeatKind: repeatKind ?? this.repeatKind,
+      intervalDays: intervalDays ?? this.intervalDays,
       weekdays: weekdays ?? this.weekdays,
       times: times ?? this.times,
+      stockQuantity: clearStockQuantity
+          ? null
+          : (stockQuantity ?? this.stockQuantity),
+      doseQuantity: doseQuantity ?? this.doseQuantity,
+      stockUnit: stockUnit ?? this.stockUnit,
+      productionDate: clearProductionDate
+          ? null
+          : (productionDate ?? this.productionDate),
+      expiryDate: clearExpiryDate ? null : (expiryDate ?? this.expiryDate),
+      usedQuantityBase: usedQuantityBase ?? this.usedQuantityBase,
+      usedQuantity: usedQuantity ?? this.usedQuantity,
       snoozeMinutes: clearSnooze ? null : (snoozeMinutes ?? this.snoozeMinutes),
       alertMonthBefore: alertMonthBefore ?? this.alertMonthBefore,
       alertWeekBefore: alertWeekBefore ?? this.alertWeekBefore,
@@ -200,6 +256,27 @@ class DayTaskGroup {
       item.times.isNotEmpty && completedCount == item.times.length;
 }
 
+class DeletedCompletion {
+  const DeletedCompletion({
+    required this.reminderTimeId,
+    required this.date,
+    required this.completedAt,
+    this.quantityUsed = 0,
+  });
+
+  final int reminderTimeId;
+  final DateTime date;
+  final DateTime completedAt;
+  final double quantityUsed;
+}
+
+class DeletedReminder {
+  const DeletedReminder({required this.item, required this.completions});
+
+  final ReminderItem item;
+  final List<DeletedCompletion> completions;
+}
+
 abstract class DailyStore {
   Future<void> initialize();
 
@@ -207,7 +284,9 @@ abstract class DailyStore {
 
   Future<ReminderItem> saveItem(ReminderItem item);
 
-  Future<void> deleteItem(int itemId);
+  Future<DeletedReminder?> deleteItem(int itemId);
+
+  Future<void> restoreDeletedItem(DeletedReminder deleted);
 
   Future<void> setCompletion({
     required int itemId,
@@ -230,7 +309,7 @@ class MemoryDailyStore implements DailyStore {
   }
 
   final List<ReminderItem> _items;
-  final Set<String> _completions = <String>{};
+  final Map<String, double> _completions = <String, double>{};
   int _nextItemId = 1;
   int _nextTimeId = 1;
 
@@ -253,6 +332,11 @@ class MemoryDailyStore implements DailyStore {
   Future<List<ReminderItem>> loadItems({bool includeArchived = false}) async {
     return _items
         .where((item) => includeArchived || !item.archived)
+        .map(
+          (item) => item.copyWith(
+            usedQuantity: item.usedQuantityBase + _usedQuantity(item.id!),
+          ),
+        )
         .toList(growable: false);
   }
 
@@ -261,31 +345,86 @@ class MemoryDailyStore implements DailyStore {
     if (item.id == null) {
       final saved = _assignIds(item);
       _items.add(saved);
-      return saved;
+      return saved.copyWith(usedQuantity: saved.usedQuantityBase);
     }
     final index = _items.indexWhere((entry) => entry.id == item.id);
-    final saved = _assignIds(item);
+    var saved = _assignIds(item);
+    if (index >= 0) {
+      final retainedIds = saved.times
+          .map((time) => time.id)
+          .whereType<int>()
+          .toSet();
+      final removedIds = _items[index].times
+          .map((time) => time.id)
+          .whereType<int>()
+          .where((id) => !retainedIds.contains(id))
+          .toSet();
+      var removedUsage = 0.0;
+      _completions.removeWhere((key, quantity) {
+        final parts = key.split(':');
+        final remove =
+            parts.length == 3 &&
+            int.tryParse(parts[0]) == item.id &&
+            removedIds.contains(int.tryParse(parts[1]));
+        if (remove) removedUsage += quantity;
+        return remove;
+      });
+      saved = saved.copyWith(
+        usedQuantityBase: _items[index].usedQuantityBase + removedUsage,
+      );
+    }
     if (index == -1) {
       _items.add(saved);
     } else {
       _items[index] = saved;
     }
-    return saved;
+    return saved.copyWith(
+      usedQuantity: saved.usedQuantityBase + _usedQuantity(saved.id!),
+    );
   }
 
   @override
-  Future<void> deleteItem(int itemId) async {
-    final timeIds = _items
-        .where((item) => item.id == itemId)
-        .expand((item) => item.times)
-        .map((time) => time.id)
-        .whereType<int>()
-        .toSet();
+  Future<DeletedReminder?> deleteItem(int itemId) async {
+    final index = _items.indexWhere((item) => item.id == itemId);
+    if (index == -1) return null;
+    final item = _items[index];
+    final timeIds = item.times.map((time) => time.id).whereType<int>().toSet();
+    final completions = <DeletedCompletion>[];
+    for (final key in _completions.keys) {
+      final parts = key.split(':');
+      if (parts.length != 3 || int.tryParse(parts[0]) != itemId) continue;
+      final reminderTimeId = int.tryParse(parts[1]);
+      if (reminderTimeId == null || !timeIds.contains(reminderTimeId)) continue;
+      completions.add(
+        DeletedCompletion(
+          reminderTimeId: reminderTimeId,
+          date: parseDay(parts[2]),
+          completedAt: DateTime.now(),
+          quantityUsed: _completions[key] ?? 0,
+        ),
+      );
+    }
     _items.removeWhere((item) => item.id == itemId);
-    _completions.removeWhere((key) {
+    _completions.removeWhere((key, _) {
       final parts = key.split(':');
       return parts.length > 1 && timeIds.contains(int.tryParse(parts[1]));
     });
+    return DeletedReminder(item: item, completions: completions);
+  }
+
+  @override
+  Future<void> restoreDeletedItem(DeletedReminder deleted) async {
+    if (_items.any((item) => item.id == deleted.item.id)) return;
+    final restored = _assignIds(deleted.item);
+    _items.add(restored);
+    for (final completion in deleted.completions) {
+      _completions[completionKey(
+            restored.id!,
+            completion.reminderTimeId,
+            completion.date,
+          )] =
+          completion.quantityUsed;
+    }
   }
 
   @override
@@ -297,7 +436,9 @@ class MemoryDailyStore implements DailyStore {
   }) async {
     final key = completionKey(itemId, reminderTimeId, date);
     if (completed) {
-      _completions.add(key);
+      if (_completions.containsKey(key)) return;
+      final item = _items.where((entry) => entry.id == itemId).first;
+      _completions[key] = item.stockQuantity == null ? 0 : item.doseQuantity;
     } else {
       _completions.remove(key);
     }
@@ -307,7 +448,7 @@ class MemoryDailyStore implements DailyStore {
   Future<Set<String>> loadCompletionKeys(DateTime from, DateTime to) async {
     final start = dayKey(from);
     final end = dayKey(to);
-    return _completions.where((key) {
+    return _completions.keys.where((key) {
       final date = key.split(':').last;
       return date.compareTo(start) >= 0 && date.compareTo(end) <= 0;
     }).toSet();
@@ -315,6 +456,10 @@ class MemoryDailyStore implements DailyStore {
 
   @override
   Future<int> completionCount() async => _completions.length;
+
+  double _usedQuantity(int itemId) => _completions.entries
+      .where((entry) => entry.key.startsWith('$itemId:'))
+      .fold(0, (sum, entry) => sum + entry.value);
 }
 
 class AppRefreshSignal {

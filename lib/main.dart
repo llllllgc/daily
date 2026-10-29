@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -5,9 +7,11 @@ import 'app.dart';
 import 'data/daily_database.dart';
 import 'models.dart';
 import 'services/notification_service.dart';
+import 'services/reminder_maintenance.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  unawaited(initializeReminderMaintenance());
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,

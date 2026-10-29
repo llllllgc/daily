@@ -1,11 +1,14 @@
-     // Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5
+// Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5
 // Hallmark · route: custom (tuned) · vibe: mineral, quiet, botanical, precise
 // Hallmark · structure: calendar-first index + in-place indented dose rail
 // Hallmark · axes: light / editorial-serif / chromatic-sage · studied: yes
 // Hallmark · audit: contrast pass · mobile pass · tokens pass · states pass
 
 import 'dart:async';
+import 'dart:ui' show PathMetric;
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import 'models.dart';
@@ -42,10 +45,58 @@ class AppRadii {
   static const pill = 28.0;
 }
 
+String quantityLabel(double value) => value == value.roundToDouble()
+    ? value.toInt().toString()
+    : value
+          .toStringAsFixed(2)
+          .replaceFirst(RegExp(r'0+$'), '')
+          .replaceFirst(RegExp(r'\.$'), '');
+
+String? inventoryStatusLabel(ReminderItem item) {
+  final remaining = item.remainingQuantity;
+  if (remaining == null) return null;
+  if (remaining <= 0) {
+    return '库存不足 · ${quantityLabel(remaining)} ${item.stockUnit}';
+  }
+  return '剩余 ${quantityLabel(remaining)} ${item.stockUnit}';
+}
+
+String? expiryStatusLabel(ReminderItem item, DateTime today) {
+  final expiry = item.expiryDate;
+  if (expiry == null) return null;
+  if (dateOnly(expiry).isBefore(dateOnly(today))) return '已过有效期';
+  return '有效期至 ${yearDate(expiry)}';
+}
+
 Duration appMotion(BuildContext context, int milliseconds) {
   return MediaQuery.disableAnimationsOf(context)
       ? Duration.zero
       : Duration(milliseconds: milliseconds);
+}
+
+class _MotionAnimatedSize extends StatelessWidget {
+  const _MotionAnimatedSize({
+    required this.milliseconds,
+    required this.child,
+    this.curve = Curves.linear,
+    this.alignment = Alignment.center,
+  });
+
+  final int milliseconds;
+  final Curve curve;
+  final AlignmentGeometry alignment;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (MediaQuery.disableAnimationsOf(context)) return child;
+    return AnimatedSize(
+      duration: Duration(milliseconds: milliseconds),
+      curve: curve,
+      alignment: alignment,
+      child: child,
+    );
+  }
 }
 
 class AppTheme {
@@ -170,6 +221,23 @@ class AppTheme {
         actionTextColor: Color(0xFFC9DDD4),
         behavior: SnackBarBehavior.floating,
       ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(0, 48),
+          elevation: 2,
+          shadowColor: AppPalette.pine.withValues(alpha: 0.22),
+          textStyle: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadii.medium),
+          ),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(
+          foregroundColor: AppPalette.pine,
+          textStyle: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+      ),
       pageTransitionsTheme: const PageTransitionsTheme(
         builders: {
           TargetPlatform.android: FadeForwardsPageTransitionsBuilder(),
@@ -227,6 +295,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   int _selectedIndex = 0;
   int _revision = 0;
   StreamSubscription<void>? _refreshSubscription;
+  bool _exactAlarmHintShown = false;
 
   @override
   void initState() {
@@ -247,7 +316,10 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _refresh();
+    if (state == AppLifecycleState.resumed) {
+      _refresh();
+      unawaited(_syncNotifications());
+    }
   }
 
   void _refresh() {
@@ -260,6 +332,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   }
 
   Future<void> _openEditor([ReminderItem? item]) async {
+    ScaffoldMessenger.of(context).clearSnackBars();
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
         builder: (_) => ItemEditorPage(store: widget.store, item: item),
@@ -268,7 +341,51 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
     if (saved ?? false) {
       _refresh();
       await _syncNotifications();
+      await _showExactAlarmHintIfNeeded();
     }
+  }
+
+  Future<void> _openSettings() async {
+    ScaffoldMessenger.of(context).clearSnackBars();
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsPage(
+          store: widget.store,
+          scheduler: widget.scheduler,
+          revision: _revision,
+        ),
+      ),
+    );
+    _refresh();
+  }
+
+  Future<void> _showExactAlarmHintIfNeeded() async {
+    if (_exactAlarmHintShown || !mounted) return;
+    final health = await widget.scheduler.health();
+    if (health.exactAlarmAllowed || !mounted) return;
+    _exactAlarmHintShown = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('请开启“闹钟和提醒”，事项才能按设定时间准时弹出'),
+        duration: const Duration(seconds: 8),
+        action: SnackBarAction(
+          label: '开启',
+          onPressed: () => unawaited(_enableExactAlarms()),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _enableExactAlarms() async {
+    final allowed = await widget.scheduler.requestExactAlarmPermission();
+    if (allowed) await _syncNotifications();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(allowed ? '准时提醒已开启' : '未开启准时提醒，系统可能延迟事项通知'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   @override
@@ -278,6 +395,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
         store: widget.store,
         revision: _revision,
         onAdd: _openEditor,
+        onOpenSettings: _openSettings,
         onDataChanged: _refresh,
       ),
       ItemsPage(
@@ -286,12 +404,8 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
         revision: _revision,
         onAdd: _openEditor,
         onEdit: _openEditor,
+        onOpenSettings: _openSettings,
         onDataChanged: _refresh,
-      ),
-      SettingsPage(
-        store: widget.store,
-        scheduler: widget.scheduler,
-        revision: _revision,
       ),
     ];
     return Scaffold(
@@ -299,6 +413,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
       bottomNavigationBar: AppBottomNavigation(
         selectedIndex: _selectedIndex,
         onSelected: (index) {
+          ScaffoldMessenger.of(context).clearSnackBars();
           setState(() {
             _selectedIndex = index;
             _revision++;
@@ -318,6 +433,7 @@ IconData iconForKey(String key) => switch (key) {
 };
 
 String shortDate(DateTime date) => '${date.month} 月 ${date.day} 日';
+String yearDate(DateTime date) => '${date.year}年${date.month}月${date.day}日';
 
 String fullDate(DateTime date) {
   const weekdays = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'];
@@ -329,6 +445,7 @@ class CalendarPage extends StatefulWidget {
     required this.store,
     required this.revision,
     required this.onAdd,
+    required this.onOpenSettings,
     required this.onDataChanged,
     super.key,
   });
@@ -336,6 +453,7 @@ class CalendarPage extends StatefulWidget {
   final DailyStore store;
   final int revision;
   final VoidCallback onAdd;
+  final VoidCallback onOpenSettings;
   final VoidCallback onDataChanged;
 
   @override
@@ -373,7 +491,6 @@ class _CalendarPageState extends State<CalendarPage> {
   }
 
   Future<void> _load() async {
-    if (mounted) setState(() => _loading = true);
     final start = _gridStart;
     final results = await Future.wait<Object>([
       widget.store.loadItems(),
@@ -393,16 +510,22 @@ class _CalendarPageState extends State<CalendarPage> {
     });
   }
 
-  List<DayTaskGroup> get _groups => _items
-      .where((item) => item.isScheduledOn(_selectedDate))
-      .map(
-        (item) => DayTaskGroup(
-          item: item,
-          date: _selectedDate,
-          completedKeys: _completionKeys,
-        ),
-      )
-      .toList(growable: false);
+  List<DayTaskGroup> get _groups {
+    final groups = _items
+        .where((item) => item.isScheduledOn(_selectedDate))
+        .map(
+          (item) => DayTaskGroup(
+            item: item,
+            date: _selectedDate,
+            completedKeys: _completionKeys,
+          ),
+        )
+        .toList(growable: false);
+    return <DayTaskGroup>[
+      ...groups.where((group) => !group.allCompleted),
+      ...groups.where((group) => group.allCompleted),
+    ];
+  }
 
   Future<void> _toggleCompletion(DayTaskGroup group, ReminderTime time) async {
     await _setCompletionValue(group, time, completed: null);
@@ -456,7 +579,8 @@ class _CalendarPageState extends State<CalendarPage> {
         final suffix = group.item.times.length > 1 ? ' · 第 $sequence 次' : '';
         messenger.showSnackBar(
           SnackBar(
-            duration: const Duration(seconds: 5),
+            duration: const Duration(seconds: 2),
+            persist: false,
             content: Text('已完成“${group.item.title}$suffix”'),
             action: SnackBarAction(
               label: '撤销',
@@ -561,6 +685,7 @@ class _CalendarPageState extends State<CalendarPage> {
               onPrevious: () => _changeMonth(-1),
               onNext: () => _changeMonth(1),
               onAdd: widget.onAdd,
+              onOpenSettings: widget.onOpenSettings,
             ),
             const SizedBox(height: 18),
             CalendarMonth(
@@ -583,34 +708,148 @@ class _CalendarPageState extends State<CalendarPage> {
             else if (groups.isEmpty)
               EmptyDayState(onAdd: widget.onAdd)
             else
-              ...groups.map((group) {
-                final itemId = group.item.id!;
-                final multiple = group.item.times.length > 1;
-                final expanded = _expandedItemIds.contains(itemId);
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: TaskGroupView(
-                    key: ValueKey<String>('group-$itemId'),
-                    group: group,
-                    expanded: multiple && expanded,
-                    onToggleExpanded: multiple
-                        ? () => setState(() {
-                            if (expanded) {
-                              _expandedItemIds.remove(itemId);
-                            } else {
-                              _expandedItemIds.add(itemId);
-                            }
-                          })
-                        : null,
-                    onToggleCompletion: (time) =>
-                        _toggleCompletion(group, time),
-                  ),
-                );
-              }),
+              _AnimatedOrderColumn(
+                key: ValueKey<String>('day-order-${dayKey(_selectedDate)}'),
+                gap: 10,
+                estimatedHeight: 82,
+                entries: [
+                  for (final group in groups)
+                    _AnimatedOrderEntry(
+                      id: group.item.id!,
+                      child: TaskGroupView(
+                        key: ValueKey<String>('group-${group.item.id}'),
+                        group: group,
+                        expanded:
+                            group.item.times.length > 1 &&
+                            _expandedItemIds.contains(group.item.id),
+                        onToggleExpanded: group.item.times.length > 1
+                            ? () => setState(() {
+                                final itemId = group.item.id!;
+                                if (!_expandedItemIds.remove(itemId)) {
+                                  _expandedItemIds.add(itemId);
+                                }
+                              })
+                            : null,
+                        onToggleCompletion: (time) =>
+                            _toggleCompletion(group, time),
+                      ),
+                    ),
+                ],
+              ),
           ],
         ),
       ),
     );
+  }
+}
+
+class _AnimatedOrderEntry {
+  const _AnimatedOrderEntry({required this.id, required this.child});
+
+  final Object id;
+  final Widget child;
+}
+
+class _AnimatedOrderColumn extends StatefulWidget {
+  const _AnimatedOrderColumn({
+    required this.entries,
+    required this.estimatedHeight,
+    this.gap = 0,
+    super.key,
+  });
+
+  final List<_AnimatedOrderEntry> entries;
+  final double estimatedHeight;
+  final double gap;
+
+  @override
+  State<_AnimatedOrderColumn> createState() => _AnimatedOrderColumnState();
+}
+
+class _AnimatedOrderColumnState extends State<_AnimatedOrderColumn> {
+  final Map<Object, double> _heights = <Object, double>{};
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.entries.isEmpty) return const SizedBox.shrink();
+    final duration = appMotion(context, 320);
+    final positions = <Object, double>{};
+    var totalHeight = 0.0;
+    for (final entry in widget.entries) {
+      positions[entry.id] = totalHeight;
+      totalHeight +=
+          (_heights[entry.id] ?? widget.estimatedHeight) + widget.gap;
+    }
+    totalHeight -= widget.gap;
+
+    return _MotionAnimatedSize(
+      milliseconds: 320,
+      curve: Curves.easeInOutCubic,
+      alignment: Alignment.topCenter,
+      child: SizedBox(
+        height: totalHeight,
+        width: double.infinity,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            for (final entry in widget.entries)
+              AnimatedPositioned(
+                key: ValueKey<Object>(entry.id),
+                duration: duration,
+                curve: Curves.easeInOutCubic,
+                top: positions[entry.id]!,
+                left: 0,
+                right: 0,
+                child: _MeasureSize(
+                  onChange: (size) {
+                    if (!mounted ||
+                        !widget.entries.any((item) => item.id == entry.id)) {
+                      return;
+                    }
+                    if (_heights[entry.id] == size.height) return;
+                    setState(() => _heights[entry.id] = size.height);
+                  },
+                  child: entry.child,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MeasureSize extends SingleChildRenderObjectWidget {
+  const _MeasureSize({required this.onChange, required super.child});
+
+  final ValueChanged<Size> onChange;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderMeasureSize(onChange);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderMeasureSize renderObject,
+  ) {
+    renderObject.onChange = onChange;
+  }
+}
+
+class _RenderMeasureSize extends RenderProxyBox {
+  _RenderMeasureSize(this.onChange);
+
+  ValueChanged<Size> onChange;
+  Size? _previousSize;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    if (_previousSize == size) return;
+    _previousSize = size;
+    final reportedSize = size;
+    WidgetsBinding.instance.addPostFrameCallback((_) => onChange(reportedSize));
   }
 }
 
@@ -620,6 +859,7 @@ class CalendarHeader extends StatelessWidget {
     required this.onPrevious,
     required this.onNext,
     required this.onAdd,
+    required this.onOpenSettings,
     super.key,
   });
 
@@ -627,6 +867,7 @@ class CalendarHeader extends StatelessWidget {
   final VoidCallback onPrevious;
   final VoidCallback onNext;
   final VoidCallback onAdd;
+  final VoidCallback onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -671,11 +912,23 @@ class CalendarHeader extends StatelessWidget {
             ],
           ),
         ),
-        SoftIconButton(
-          key: const Key('add-item-button'),
-          icon: Icons.add_rounded,
-          tooltip: '新建事项',
-          onPressed: onAdd,
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SoftIconButton(
+              key: const Key('add-item-button'),
+              icon: Icons.add_rounded,
+              tooltip: '新建事项',
+              onPressed: onAdd,
+            ),
+            const SizedBox(width: 8),
+            SoftIconButton(
+              key: const Key('calendar-settings-button'),
+              icon: Icons.settings_rounded,
+              tooltip: '设置',
+              onPressed: onOpenSettings,
+            ),
+          ],
         ),
       ],
     );
@@ -921,6 +1174,8 @@ class TaskGroupView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isMultiple = group.item.times.length > 1;
+    final inventoryLabel = inventoryStatusLabel(group.item);
+    final expiryLabel = expiryStatusLabel(group.item, group.date);
     final onlyTime = isMultiple ? null : group.item.times.single;
     final singleCompleted = onlyTime != null && group.isCompleted(onlyTime);
     final parentCompleted = isMultiple ? group.allCompleted : singleCompleted;
@@ -931,7 +1186,10 @@ class TaskGroupView extends StatelessWidget {
           color: parentCompleted
               ? AppPalette.completedNote
               : AppPalette.parentNote,
+          animationDuration: appMotion(context, 240),
           borderRadius: BorderRadius.circular(AppRadii.large),
+          elevation: parentCompleted ? 0 : 1,
+          shadowColor: AppPalette.pine.withValues(alpha: 0.13),
           clipBehavior: Clip.antiAlias,
           child: InkWell(
             key: ValueKey<String>('task-${group.item.id}'),
@@ -973,6 +1231,33 @@ class TaskGroupView extends StatelessWidget {
                             overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
+                          if (inventoryLabel != null ||
+                              expiryLabel != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              [
+                                inventoryLabel,
+                                expiryLabel,
+                              ].whereType<String>().join(' · '),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(
+                                    color:
+                                        (group.item.remainingQuantity ?? 1) <=
+                                                0 ||
+                                            (group.item.expiryDate != null &&
+                                                dateOnly(
+                                                  group.item.expiryDate!,
+                                                ).isBefore(
+                                                  dateOnly(group.date),
+                                                ))
+                                        ? AppPalette.missed
+                                        : AppPalette.pine,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -1008,8 +1293,8 @@ class TaskGroupView extends StatelessWidget {
             ),
           ),
         ),
-        AnimatedSize(
-          duration: appMotion(context, 240),
+        _MotionAnimatedSize(
+          milliseconds: 240,
           curve: Curves.easeOutCubic,
           alignment: Alignment.topCenter,
           child: expanded
@@ -1044,19 +1329,19 @@ class DoseRail extends StatelessWidget {
             bottom: 13,
             child: Container(width: 1, color: AppPalette.mutedLight),
           ),
-          Column(
-            children: [
-              for (var index = 0; index < times.length; index++)
-                Padding(
-                  padding: EdgeInsets.only(
-                    bottom: index == times.length - 1 ? 0 : 6,
-                  ),
+          _AnimatedOrderColumn(
+            gap: 6,
+            estimatedHeight: 58,
+            entries: [
+              for (final time in times)
+                _AnimatedOrderEntry(
+                  id: time.id!,
                   child: DoseRow(
-                    key: ValueKey<String>('dose-${times[index].id}'),
-                    time: times[index],
-                    sequence: times[index].sortOrder + 1,
-                    completed: group.isCompleted(times[index]),
-                    onPressed: () => onToggleCompletion(times[index]),
+                    key: ValueKey<String>('dose-${time.id}'),
+                    time: time,
+                    sequence: time.sortOrder + 1,
+                    completed: group.isCompleted(time),
+                    onPressed: () => onToggleCompletion(time),
                   ),
                 ),
             ],
@@ -1144,7 +1429,7 @@ class DoseRow extends StatelessWidget {
   }
 }
 
-class CompletionButton extends StatelessWidget {
+class CompletionButton extends StatefulWidget {
   const CompletionButton({
     required this.completed,
     required this.onPressed,
@@ -1155,42 +1440,155 @@ class CompletionButton extends StatelessWidget {
   final VoidCallback onPressed;
 
   @override
+  State<CompletionButton> createState() => _CompletionButtonState();
+}
+
+class _CompletionButtonState extends State<CompletionButton>
+    with SingleTickerProviderStateMixin {
+  // Fill first, then draw the check while the filled circle pops and settles.
+  static const _completeDuration = Duration(milliseconds: 460);
+  static const _undoDuration = Duration(milliseconds: 220);
+
+  late final AnimationController _progress;
+  bool _reduceMotion = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _progress = AnimationController(
+      vsync: this,
+      duration: _completeDuration,
+      reverseDuration: _undoDuration,
+      value: widget.completed ? 1 : 0,
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _reduceMotion = MediaQuery.disableAnimationsOf(context);
+    if (_reduceMotion) _progress.value = widget.completed ? 1 : 0;
+  }
+
+  @override
+  void didUpdateWidget(CompletionButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.completed == widget.completed) return;
+    if (_reduceMotion) {
+      _progress.value = widget.completed ? 1 : 0;
+    } else if (widget.completed) {
+      _progress.forward();
+    } else {
+      _progress.reverse();
+    }
+  }
+
+  @override
+  void dispose() {
+    _progress.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Semantics(
       button: true,
-      checked: completed,
-      label: completed ? '撤销完成' : '标记完成',
+      checked: widget.completed,
+      label: widget.completed ? '撤销完成' : '标记完成',
       child: SizedBox(
         width: 48,
         height: 48,
         child: IconButton(
-          tooltip: completed ? '撤销完成' : '完成',
-          onPressed: onPressed,
-          icon: AnimatedContainer(
-            key: completed ? const Key('completed-check') : null,
-            duration: appMotion(context, 120),
-            width: 25,
-            height: 25,
-            decoration: BoxDecoration(
-              color: completed ? AppPalette.pine : Colors.transparent,
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: completed ? AppPalette.pine : AppPalette.muted,
-                width: 1.5,
-              ),
-            ),
-            child: completed
-                ? const Icon(
-                    Icons.check_rounded,
-                    size: 17,
-                    color: AppPalette.pineInk,
-                  )
-                : null,
+          tooltip: widget.completed ? '撤销完成' : '完成',
+          onPressed: widget.onPressed,
+          icon: CustomPaint(
+            key: widget.completed ? const Key('completed-check') : null,
+            size: const Size.square(25),
+            painter: _CompletionPainter(_progress),
           ),
         ),
       ),
     );
   }
+}
+
+class _CompletionPainter extends CustomPainter {
+  _CompletionPainter(this.progress) : super(repaint: progress);
+
+  final Animation<double> progress;
+
+  static const _fillCurve = Interval(0, 0.38, curve: Curves.easeOutCubic);
+  static const _checkCurve = Interval(0.34, 0.78, curve: Curves.easeInOutCubic);
+  static final _scale = TweenSequence<double>([
+    TweenSequenceItem(tween: ConstantTween<double>(1), weight: 38),
+    TweenSequenceItem(
+      tween: Tween<double>(
+        begin: 1,
+        end: 1.18,
+      ).chain(CurveTween(curve: Curves.easeOutCubic)),
+      weight: 18,
+    ),
+    TweenSequenceItem(
+      tween: Tween<double>(
+        begin: 1.18,
+        end: 0.96,
+      ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+      weight: 22,
+    ),
+    TweenSequenceItem(
+      tween: Tween<double>(
+        begin: 0.96,
+        end: 1,
+      ).chain(CurveTween(curve: Curves.easeOutCubic)),
+      weight: 22,
+    ),
+  ]);
+  static final Path _check = Path()
+    ..moveTo(6.8, 12.5)
+    ..lineTo(10.5, 16.2)
+    ..lineTo(18.2, 8.6);
+  static final PathMetric _checkMetric = _check.computeMetrics().single;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final value = progress.value;
+    final fill = _fillCurve.transform(value);
+    final check = _checkCurve.transform(value);
+    final scale = _scale.transform(value) * size.shortestSide / 25;
+    canvas.save();
+    canvas.translate(size.width / 2, size.height / 2);
+    canvas.scale(scale);
+    canvas.translate(-12.5, -12.5);
+    const center = Offset(12.5, 12.5);
+
+    if (fill > 0) {
+      canvas.drawCircle(center, 12.5 * fill, Paint()..color = AppPalette.pine);
+    }
+    canvas.drawCircle(
+      center,
+      11.75,
+      Paint()
+        ..color = Color.lerp(AppPalette.muted, AppPalette.pine, fill)!
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+    if (check > 0) {
+      canvas.drawPath(
+        _checkMetric.extractPath(0, _checkMetric.length * check),
+        Paint()
+          ..color = AppPalette.pineInk
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.9
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round,
+      );
+    }
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_CompletionPainter oldDelegate) =>
+      oldDelegate.progress != progress;
 }
 
 class EmptyDayState extends StatelessWidget {
@@ -1284,20 +1682,31 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
   late DateTime _startDate;
   late DateTime? _endDate;
   late RepeatKind _repeatKind;
+  late int _intervalDays;
   late Set<int> _weekdays;
   late List<_EditableTime> _times;
+  late final TextEditingController _stockController;
+  late final TextEditingController _doseController;
+  late String _stockUnit;
+  late DateTime? _productionDate;
+  late DateTime? _expiryDate;
   late bool _snoozeEnabled;
   late int _snoozeMinutes;
   late bool _alertMonthBefore;
   late bool _alertWeekBefore;
-  bool _advancedExpanded = false;
   bool _saving = false;
 
-  String get _advancedSummary {
-    final repeat = _repeatKind == RepeatKind.daily ? '每天' : '每周';
-    final snooze = _snoozeEnabled ? '稍后 $_snoozeMinutes 分钟' : '不重复提醒';
-    return '$repeat · $snooze';
-  }
+  String get _frequencyLabel => switch (_repeatKind) {
+    RepeatKind.daily => '每天 · ${_times.length} 次',
+    RepeatKind.weekly => '选定日 · ${_times.length} 次',
+    RepeatKind.interval => '每 $_intervalDays 天 · ${_times.length} 次',
+  };
+
+  int get _frequencyDays => switch (_repeatKind) {
+    RepeatKind.daily => 1,
+    RepeatKind.weekly => _intervalDays.clamp(2, 365),
+    RepeatKind.interval => _intervalDays.clamp(2, 365),
+  };
 
   @override
   void initState() {
@@ -1309,7 +1718,19 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     _startDate = item?.startDate ?? today;
     _endDate = item?.endDate;
     _repeatKind = item?.repeatKind ?? RepeatKind.daily;
+    _intervalDays = item?.intervalDays ?? 2;
     _weekdays = Set<int>.from(item?.weekdays ?? <int>{today.weekday});
+    _stockController = TextEditingController(
+      text: item?.stockQuantity == null
+          ? ''
+          : quantityLabel(item!.stockQuantity!),
+    );
+    _doseController = TextEditingController(
+      text: quantityLabel(item?.doseQuantity ?? 1),
+    );
+    _stockUnit = item?.stockUnit ?? '片';
+    _productionDate = item?.productionDate;
+    _expiryDate = item?.expiryDate;
     _times = (item?.times ?? const <ReminderTime>[])
         .map(
           (time) => _EditableTime(id: time.id, minuteOfDay: time.minuteOfDay),
@@ -1325,6 +1746,8 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
   @override
   void dispose() {
     _titleController.dispose();
+    _stockController.dispose();
+    _doseController.dispose();
     super.dispose();
   }
 
@@ -1363,6 +1786,20 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     setState(() => _endDate = dateOnly(picked));
   }
 
+  Future<void> _pickProductionDate() async {
+    final picked = await _pickDate(_productionDate ?? dateOnly(DateTime.now()));
+    if (picked == null || !mounted) return;
+    setState(() => _productionDate = dateOnly(picked));
+  }
+
+  Future<void> _pickExpiryDate() async {
+    final picked = await _pickDate(
+      _expiryDate ?? _productionDate ?? dateOnly(DateTime.now()),
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _expiryDate = dateOnly(picked));
+  }
+
   Future<void> _pickTime(int index) async {
     final current = _times[index];
     final picked = await showTimePicker(
@@ -1393,20 +1830,91 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     });
   }
 
-  void _addTime() {
-    final used = _times.map((time) => time.minuteOfDay).toSet();
-    var candidate = (_times.last.minuteOfDay + 4 * 60).clamp(0, 23 * 60 + 59);
-    while (used.contains(candidate) && candidate < 23 * 60 + 59) {
-      candidate = (candidate + 30).clamp(0, 23 * 60 + 59);
-    }
+  Future<void> _pickFrequency() async {
+    FocusScope.of(context).unfocus();
+    final selection = await showModalBottomSheet<_FrequencySelection>(
+      context: context,
+      useSafeArea: true,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: AppPalette.canvasRaised,
+      barrierColor: AppPalette.ink.withValues(alpha: 0.26),
+      constraints: const BoxConstraints(maxWidth: 560),
+      sheetAnimationStyle: AnimationStyle(
+        duration: appMotion(context, 280),
+        reverseDuration: appMotion(context, 220),
+      ),
+      builder: (context) => _FrequencyPickerSheet(
+        initialDays: _frequencyDays,
+        initialTimes: _times.length.clamp(1, 8),
+        allowDaySelection: _repeatKind != RepeatKind.weekly,
+      ),
+    );
+    if (selection == null || !mounted) return;
     setState(() {
-      _times.add(_EditableTime(minuteOfDay: candidate));
-      _times.sort((a, b) => a.minuteOfDay.compareTo(b.minuteOfDay));
+      if (_repeatKind != RepeatKind.weekly) {
+        _intervalDays = selection.days;
+        _repeatKind = selection.days == 1
+            ? RepeatKind.daily
+            : RepeatKind.interval;
+      }
+      _resizeTimes(selection.times);
     });
+    HapticFeedback.lightImpact();
+  }
+
+  void _resizeTimes(int requestedCount) {
+    final count = requestedCount.clamp(1, 8);
+    if (count == _times.length) return;
+    if (count < _times.length) {
+      final current = List<_EditableTime>.from(_times);
+      if (count == 1) {
+        _times = [current.first];
+        return;
+      }
+      _times = [
+        for (var index = 0; index < count; index++)
+          current[(index * (current.length - 1) / (count - 1)).round()],
+      ];
+      return;
+    }
+
+    final used = _times.map((time) => time.minuteOfDay).toSet();
+    const preferredMinutes = <int>[
+      9 * 60,
+      20 * 60,
+      13 * 60,
+      17 * 60,
+      8 * 60,
+      11 * 60,
+      15 * 60,
+      22 * 60,
+    ];
+    for (final minute in preferredMinutes) {
+      if (_times.length >= count) break;
+      if (used.add(minute)) {
+        _times.add(_EditableTime(minuteOfDay: minute));
+      }
+    }
+    for (var minute = 7 * 60; _times.length < count; minute += 30) {
+      if (minute > 23 * 60 + 30) minute = 0;
+      if (used.add(minute)) {
+        _times.add(_EditableTime(minuteOfDay: minute));
+      }
+    }
+    _times.sort((a, b) => a.minuteOfDay.compareTo(b.minuteOfDay));
   }
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
+    if (_productionDate != null &&
+        _expiryDate != null &&
+        _expiryDate!.isBefore(_productionDate!)) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('有效期不能早于生产日期')));
+      return;
+    }
     if (_repeatKind == RepeatKind.weekly && _weekdays.isEmpty) {
       ScaffoldMessenger.of(
         context,
@@ -1422,7 +1930,17 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
         startDate: _startDate,
         endDate: _endDate,
         repeatKind: _repeatKind,
+        intervalDays: _intervalDays,
         weekdays: _repeatKind == RepeatKind.weekly ? _weekdays : const <int>{},
+        stockQuantity: _stockController.text.trim().isEmpty
+            ? null
+            : double.parse(_stockController.text.trim()),
+        doseQuantity: double.parse(_doseController.text.trim()),
+        stockUnit: _stockUnit,
+        productionDate: _productionDate,
+        expiryDate: _expiryDate,
+        usedQuantityBase: widget.item?.usedQuantityBase ?? 0,
+        usedQuantity: widget.item?.usedQuantity ?? 0,
         times: [
           for (var index = 0; index < _times.length; index++)
             ReminderTime(
@@ -1477,72 +1995,54 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                 validator: (value) =>
                     value == null || value.trim().isEmpty ? '请填写事项名称' : null,
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 18),
+              const SectionLabel('图标'),
+              const SizedBox(height: 8),
               FormSurface(
-                padding: EdgeInsets.zero,
-                child: ListTile(
-                  key: const Key('advanced-settings-toggle'),
-                  minTileHeight: 62,
-                  leading: const Icon(Icons.tune_rounded),
-                  title: const Text('更多设置'),
-                  subtitle: Text(_advancedSummary),
-                  trailing: AnimatedRotation(
-                    turns: _advancedExpanded ? 0.5 : 0,
-                    duration: appMotion(context, 180),
-                    child: const Icon(Icons.keyboard_arrow_down_rounded),
-                  ),
-                  onTap: () =>
-                      setState(() => _advancedExpanded = !_advancedExpanded),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children:
+                      const {
+                        'medication': Icons.medication_outlined,
+                        'vitamin': Icons.eco_outlined,
+                        'exercise': Icons.fitness_center_rounded,
+                        'eye': Icons.visibility_outlined,
+                        'water': Icons.water_drop_outlined,
+                      }.entries.map((entry) {
+                        final selected = _iconKey == entry.key;
+                        return ChoiceChip(
+                          key: ValueKey<String>('icon-${entry.key}'),
+                          selected: selected,
+                          showCheckmark: false,
+                          avatar: Icon(
+                            entry.value,
+                            size: 20,
+                            color: selected
+                                ? AppPalette.pineInk
+                                : AppPalette.ink,
+                          ),
+                          label: Text(switch (entry.key) {
+                            'vitamin' => '营养',
+                            'exercise' => '运动',
+                            'eye' => '护理',
+                            'water' => '饮水',
+                            _ => '用药',
+                          }),
+                          selectedColor: AppPalette.pine,
+                          labelStyle: TextStyle(
+                            color: selected
+                                ? AppPalette.pineInk
+                                : AppPalette.ink,
+                          ),
+                          onSelected: (_) {
+                            setState(() => _iconKey = entry.key);
+                            HapticFeedback.selectionClick();
+                          },
+                        );
+                      }).toList(),
                 ),
               ),
-              if (_advancedExpanded) ...[
-                const SizedBox(height: 18),
-                const SectionLabel('图标'),
-                const SizedBox(height: 8),
-                FormSurface(
-                  child: Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children:
-                        const {
-                          'medication': Icons.medication_outlined,
-                          'vitamin': Icons.eco_outlined,
-                          'exercise': Icons.fitness_center_rounded,
-                          'eye': Icons.visibility_outlined,
-                          'water': Icons.water_drop_outlined,
-                        }.entries.map((entry) {
-                          final selected = _iconKey == entry.key;
-                          return ChoiceChip(
-                            key: ValueKey<String>('icon-${entry.key}'),
-                            selected: selected,
-                            showCheckmark: false,
-                            avatar: Icon(
-                              entry.value,
-                              size: 20,
-                              color: selected
-                                  ? AppPalette.pineInk
-                                  : AppPalette.ink,
-                            ),
-                            label: Text(switch (entry.key) {
-                              'vitamin' => '营养',
-                              'exercise' => '运动',
-                              'eye' => '护理',
-                              'water' => '饮水',
-                              _ => '用药',
-                            }),
-                            selectedColor: AppPalette.pine,
-                            labelStyle: TextStyle(
-                              color: selected
-                                  ? AppPalette.pineInk
-                                  : AppPalette.ink,
-                            ),
-                            onSelected: (_) =>
-                                setState(() => _iconKey = entry.key),
-                          );
-                        }).toList(),
-                  ),
-                ),
-              ],
               const SizedBox(height: 18),
               const SectionLabel('日期'),
               const SizedBox(height: 8),
@@ -1573,56 +2073,208 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                   ],
                 ),
               ),
-              if (_advancedExpanded) ...[
-                const SizedBox(height: 18),
-                const SectionLabel('重复'),
-                const SizedBox(height: 8),
-                FormSurface(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      SegmentedButton<RepeatKind>(
-                        segments: const [
-                          ButtonSegment(
-                            value: RepeatKind.daily,
-                            label: Text('每天'),
-                          ),
-                          ButtonSegment(
-                            value: RepeatKind.weekly,
-                            label: Text('每周'),
-                          ),
-                        ],
-                        selected: {_repeatKind},
-                        onSelectionChanged: (value) =>
-                            setState(() => _repeatKind = value.single),
+              const SizedBox(height: 18),
+              const SectionLabel('药品与库存'),
+              const SizedBox(height: 6),
+              Text(
+                '录入后按实际完成次数扣减，留空则不统计库存',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 10),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: TextFormField(
+                      key: const Key('stock-quantity-field'),
+                      controller: _stockController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
                       ),
-                      if (_repeatKind == RepeatKind.weekly) ...[
-                        const SizedBox(height: 14),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 6,
-                          children: List.generate(7, (index) {
-                            final day = index + 1;
-                            const labels = ['一', '二', '三', '四', '五', '六', '日'];
-                            return FilterChip(
-                              label: Text(labels[index]),
-                              selected: _weekdays.contains(day),
-                              showCheckmark: false,
-                              onSelected: (selected) => setState(() {
-                                if (selected) {
-                                  _weekdays.add(day);
-                                } else {
-                                  _weekdays.remove(day);
-                                }
-                              }),
-                            );
-                          }),
-                        ),
-                      ],
-                    ],
+                      decoration: const InputDecoration(
+                        labelText: '录入数量',
+                        hintText: '选填',
+                      ),
+                      validator: (value) {
+                        if (value == null || value.trim().isEmpty) return null;
+                        final amount = double.tryParse(value.trim());
+                        return amount == null ||
+                                !amount.isFinite ||
+                                amount < 0 ||
+                                !RegExp(
+                                  r'^\d+(\.\d{1,2})?$',
+                                ).hasMatch(value.trim())
+                            ? '请输入不小于 0 的数字'
+                            : null;
+                      },
+                    ),
                   ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextFormField(
+                      key: const Key('dose-quantity-field'),
+                      controller: _doseController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: const InputDecoration(labelText: '每次用量'),
+                      validator: (value) {
+                        final amount = double.tryParse(value?.trim() ?? '');
+                        return amount == null ||
+                                !amount.isFinite ||
+                                amount <= 0 ||
+                                !RegExp(
+                                  r'^\d+(\.\d{1,2})?$',
+                                ).hasMatch(value!.trim())
+                            ? '请输入大于 0 的数字'
+                            : null;
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                key: const Key('stock-unit-field'),
+                initialValue: _stockUnit,
+                decoration: const InputDecoration(labelText: '单位'),
+                items: const ['片', '粒', '支', '袋', '毫升', '滴', '贴', '盒']
+                    .map(
+                      (unit) =>
+                          DropdownMenuItem(value: unit, child: Text(unit)),
+                    )
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => _stockUnit = value);
+                },
+              ),
+              if (widget.item?.stockQuantity != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '已记录使用 ${quantityLabel(widget.item!.usedQuantity)} $_stockUnit；修改录入数量后，历史消耗仍保留',
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
+              const SizedBox(height: 10),
+              FormSurface(
+                padding: EdgeInsets.zero,
+                child: Column(
+                  children: [
+                    FormActionRow(
+                      icon: Icons.factory_outlined,
+                      label: '生产日期',
+                      value: _productionDate == null
+                          ? '未填写'
+                          : yearDate(_productionDate!),
+                      onTap: _pickProductionDate,
+                      trailing: _productionDate == null
+                          ? null
+                          : IconButton(
+                              tooltip: '清除生产日期',
+                              onPressed: () =>
+                                  setState(() => _productionDate = null),
+                              icon: const Icon(Icons.close_rounded, size: 20),
+                            ),
+                    ),
+                    const Divider(indent: 52),
+                    FormActionRow(
+                      icon: Icons.event_busy_outlined,
+                      label: '有效期至',
+                      value: _expiryDate == null
+                          ? '未填写'
+                          : yearDate(_expiryDate!),
+                      onTap: _pickExpiryDate,
+                      trailing: _expiryDate == null
+                          ? null
+                          : IconButton(
+                              tooltip: '清除有效期',
+                              onPressed: () =>
+                                  setState(() => _expiryDate = null),
+                              icon: const Icon(Icons.close_rounded, size: 20),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              const SectionLabel('重复'),
+              const SizedBox(height: 8),
+              FormSurface(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SegmentedButton<RepeatKind>(
+                      segments: const [
+                        ButtonSegment(
+                          value: RepeatKind.daily,
+                          label: Text('每天'),
+                        ),
+                        ButtonSegment(
+                          value: RepeatKind.weekly,
+                          label: Text('每周'),
+                        ),
+                        ButtonSegment(
+                          value: RepeatKind.interval,
+                          label: Text('隔几天'),
+                        ),
+                      ],
+                      selected: {_repeatKind},
+                      onSelectionChanged: (value) {
+                        final repeatKind = value.single;
+                        setState(() {
+                          _repeatKind = repeatKind;
+                          if (repeatKind == RepeatKind.interval &&
+                              _intervalDays < 2) {
+                            _intervalDays = 2;
+                          }
+                        });
+                        HapticFeedback.selectionClick();
+                      },
+                    ),
+                    _MotionAnimatedSize(
+                      milliseconds: 220,
+                      curve: Curves.easeOutCubic,
+                      alignment: Alignment.topCenter,
+                      child: _repeatKind == RepeatKind.weekly
+                          ? Padding(
+                              padding: const EdgeInsets.only(top: 14),
+                              child: Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                children: List.generate(7, (index) {
+                                  final day = index + 1;
+                                  const labels = [
+                                    '一',
+                                    '二',
+                                    '三',
+                                    '四',
+                                    '五',
+                                    '六',
+                                    '日',
+                                  ];
+                                  return FilterChip(
+                                    label: Text(labels[index]),
+                                    selected: _weekdays.contains(day),
+                                    showCheckmark: false,
+                                    onSelected: (selected) {
+                                      setState(() {
+                                        if (selected) {
+                                          _weekdays.add(day);
+                                        } else {
+                                          _weekdays.remove(day);
+                                        }
+                                      });
+                                      HapticFeedback.selectionClick();
+                                    },
+                                  );
+                                }),
+                              ),
+                            )
+                          : const SizedBox(width: double.infinity),
+                    ),
+                  ],
+                ),
+              ),
               const SizedBox(height: 18),
               const SectionLabel('提醒时间'),
               const SizedBox(height: 8),
@@ -1630,98 +2282,102 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                 padding: EdgeInsets.zero,
                 child: Column(
                   children: [
-                    for (var index = 0; index < _times.length; index++) ...[
-                      FormActionRow(
-                        key: ValueKey<String>('editor-time-$index'),
-                        icon: Icons.schedule_rounded,
-                        label: _times.length == 1 ? '时间' : '第 ${index + 1} 次',
-                        value: _times[index].label,
-                        onTap: () => _pickTime(index),
-                        trailing: _times.length == 1
-                            ? null
-                            : IconButton(
-                                tooltip: '移除这个时间',
-                                onPressed: () =>
-                                    setState(() => _times.removeAt(index)),
-                                icon: const Icon(
-                                  Icons.remove_circle_outline,
-                                  size: 21,
-                                ),
-                              ),
-                      ),
-                      if (index != _times.length - 1) const Divider(indent: 52),
-                    ],
-                    const Divider(indent: 52),
-                    TextButton.icon(
-                      onPressed: _times.length >= 8 ? null : _addTime,
-                      icon: const Icon(Icons.add_circle_outline),
-                      label: const Text('添加提醒时间'),
+                    FormActionRow(
+                      key: const Key('frequency-picker-row'),
+                      icon: Icons.repeat_rounded,
+                      label: '服用频率',
+                      value: _frequencyLabel,
+                      onTap: _pickFrequency,
                     ),
-                    const SizedBox(height: 4),
+                    const Divider(indent: 52),
+                    _MotionAnimatedSize(
+                      milliseconds: 240,
+                      curve: Curves.easeOutCubic,
+                      alignment: Alignment.topCenter,
+                      child: Column(
+                        children: [
+                          for (
+                            var index = 0;
+                            index < _times.length;
+                            index++
+                          ) ...[
+                            FormActionRow(
+                              key: ValueKey<String>('editor-time-$index'),
+                              icon: Icons.schedule_rounded,
+                              label: _times.length == 1
+                                  ? '时间'
+                                  : '第 ${index + 1} 次',
+                              value: _times[index].label,
+                              onTap: () => _pickTime(index),
+                            ),
+                            if (index != _times.length - 1)
+                              const Divider(indent: 52),
+                          ],
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),
-              if (_advancedExpanded) ...[
+              const SizedBox(height: 18),
+              const SectionLabel('重复提醒'),
+              const SizedBox(height: 8),
+              FormSurface(
+                child: Column(
+                  children: [
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('间隔一段时间再提醒'),
+                      subtitle: const Text('提醒不会替你完成事项'),
+                      value: _snoozeEnabled,
+                      activeTrackColor: AppPalette.pine,
+                      onChanged: (value) =>
+                          setState(() => _snoozeEnabled = value),
+                    ),
+                    if (_snoozeEnabled)
+                      Wrap(
+                        spacing: 8,
+                        children: [10, 30, 60]
+                            .map(
+                              (minutes) => ChoiceChip(
+                                selected: _snoozeMinutes == minutes,
+                                showCheckmark: false,
+                                label: Text('$minutes 分钟'),
+                                onSelected: (_) =>
+                                    setState(() => _snoozeMinutes = minutes),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                  ],
+                ),
+              ),
+              if (_endDate != null) ...[
                 const SizedBox(height: 18),
-                const SectionLabel('重复提醒'),
+                const SectionLabel('周期结束前提醒'),
                 const SizedBox(height: 8),
                 FormSurface(
+                  padding: EdgeInsets.zero,
                   child: Column(
                     children: [
                       SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('间隔一段时间再提醒'),
-                        subtitle: const Text('提醒不会替你完成事项'),
-                        value: _snoozeEnabled,
+                        title: const Text('提前一个月'),
+                        value: _alertMonthBefore,
                         activeTrackColor: AppPalette.pine,
                         onChanged: (value) =>
-                            setState(() => _snoozeEnabled = value),
+                            setState(() => _alertMonthBefore = value),
                       ),
-                      if (_snoozeEnabled)
-                        Wrap(
-                          spacing: 8,
-                          children: [10, 30, 60]
-                              .map(
-                                (minutes) => ChoiceChip(
-                                  selected: _snoozeMinutes == minutes,
-                                  showCheckmark: false,
-                                  label: Text('$minutes 分钟'),
-                                  onSelected: (_) =>
-                                      setState(() => _snoozeMinutes = minutes),
-                                ),
-                              )
-                              .toList(),
-                        ),
+                      const Divider(indent: 16, endIndent: 16),
+                      SwitchListTile.adaptive(
+                        title: const Text('提前一周'),
+                        value: _alertWeekBefore,
+                        activeTrackColor: AppPalette.pine,
+                        onChanged: (value) =>
+                            setState(() => _alertWeekBefore = value),
+                      ),
                     ],
                   ),
                 ),
-                if (_endDate != null) ...[
-                  const SizedBox(height: 18),
-                  const SectionLabel('周期结束前提醒'),
-                  const SizedBox(height: 8),
-                  FormSurface(
-                    padding: EdgeInsets.zero,
-                    child: Column(
-                      children: [
-                        SwitchListTile.adaptive(
-                          title: const Text('提前一个月'),
-                          value: _alertMonthBefore,
-                          activeTrackColor: AppPalette.pine,
-                          onChanged: (value) =>
-                              setState(() => _alertMonthBefore = value),
-                        ),
-                        const Divider(indent: 16, endIndent: 16),
-                        SwitchListTile.adaptive(
-                          title: const Text('提前一周'),
-                          value: _alertWeekBefore,
-                          activeTrackColor: AppPalette.pine,
-                          onChanged: (value) =>
-                              setState(() => _alertWeekBefore = value),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
               ],
               const SizedBox(height: 28),
               SizedBox(
@@ -1732,6 +2388,8 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                   style: FilledButton.styleFrom(
                     backgroundColor: AppPalette.pine,
                     foregroundColor: AppPalette.pineInk,
+                    elevation: 3,
+                    shadowColor: AppPalette.pine.withValues(alpha: 0.28),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(AppRadii.pill),
                     ),
@@ -1842,6 +2500,224 @@ class FormActionRow extends StatelessWidget {
   }
 }
 
+class _FrequencySelection {
+  const _FrequencySelection({required this.days, required this.times});
+
+  final int days;
+  final int times;
+}
+
+class _FrequencyPickerSheet extends StatefulWidget {
+  const _FrequencyPickerSheet({
+    required this.initialDays,
+    required this.initialTimes,
+    required this.allowDaySelection,
+  });
+
+  final int initialDays;
+  final int initialTimes;
+  final bool allowDaySelection;
+
+  @override
+  State<_FrequencyPickerSheet> createState() => _FrequencyPickerSheetState();
+}
+
+class _FrequencyPickerSheetState extends State<_FrequencyPickerSheet> {
+  late int _days;
+  late int _times;
+  late final FixedExtentScrollController _daysController;
+  late final FixedExtentScrollController _timesController;
+
+  @override
+  void initState() {
+    super.initState();
+    _days = widget.initialDays.clamp(1, 365);
+    _times = widget.initialTimes.clamp(1, 8);
+    _daysController = FixedExtentScrollController(initialItem: _days - 1);
+    _timesController = FixedExtentScrollController(initialItem: _times - 1);
+  }
+
+  @override
+  void dispose() {
+    _daysController.dispose();
+    _timesController.dispose();
+    super.dispose();
+  }
+
+  String get _summary {
+    if (!widget.allowDaySelection) return '每个选定日 · $_times 次';
+    if (_days == 1) return '每天 · $_times 次';
+    return '每 $_days 天 · $_times 次';
+  }
+
+  Widget _numberWheel({
+    required Key key,
+    required FixedExtentScrollController controller,
+    required int selectedValue,
+    required int childCount,
+    required String suffix,
+    required ValueChanged<int> onChanged,
+  }) {
+    return SizedBox(
+      height: 188,
+      child: CupertinoPicker.builder(
+        key: key,
+        scrollController: controller,
+        itemExtent: 46,
+        diameterRatio: 1.35,
+        squeeze: 1.08,
+        useMagnifier: true,
+        magnification: 1.06,
+        selectionOverlay: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 4),
+          decoration: BoxDecoration(
+            color: AppPalette.parentNote.withValues(alpha: 0.24),
+            borderRadius: BorderRadius.circular(AppRadii.medium),
+            border: Border.all(color: AppPalette.pine.withValues(alpha: 0.18)),
+          ),
+        ),
+        childCount: childCount,
+        onSelectedItemChanged: (index) => onChanged(index + 1),
+        itemBuilder: (context, index) {
+          final value = index + 1;
+          final selected = value == selectedValue;
+          return Center(
+            child: AnimatedDefaultTextStyle(
+              duration: appMotion(context, 140),
+              curve: Curves.easeOutCubic,
+              style: Theme.of(context).textTheme.titleLarge!.copyWith(
+                color: selected ? AppPalette.pine : AppPalette.muted,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+              child: Text('$value $suffix'),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomPadding = MediaQuery.viewPaddingOf(context).bottom;
+    final wheels = <Widget>[
+      if (widget.allowDaySelection)
+        Expanded(
+          child: Semantics(
+            label: '间隔天数',
+            value: '$_days 天',
+            child: Column(
+              children: [
+                Text('间隔天数', style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 4),
+                _numberWheel(
+                  key: const Key('frequency-days-wheel'),
+                  controller: _daysController,
+                  selectedValue: _days,
+                  childCount: 365,
+                  suffix: '天',
+                  onChanged: (value) => setState(() => _days = value),
+                ),
+              ],
+            ),
+          ),
+        ),
+      if (widget.allowDaySelection) const SizedBox(width: 12),
+      Expanded(
+        child: Semantics(
+          label: '当天次数',
+          value: '$_times 次',
+          child: Column(
+            children: [
+              Text(
+                widget.allowDaySelection ? '当天次数' : '每日次数',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 4),
+              _numberWheel(
+                key: const Key('frequency-times-wheel'),
+                controller: _timesController,
+                selectedValue: _times,
+                childCount: 8,
+                suffix: '次',
+                onChanged: (value) => setState(() => _times = value),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ];
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(24, 0, 24, 20 + bottomPadding),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '服用频率',
+                      style: Theme.of(context).textTheme.headlineMedium,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      widget.allowDaySelection
+                          ? '滚动设置间隔天数和当天次数'
+                          : '滚动设置每个选定日的次数',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              TextButton(
+                key: const Key('frequency-picker-cancel'),
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('取消'),
+              ),
+              const SizedBox(width: 6),
+              FilledButton(
+                key: const Key('frequency-picker-confirm'),
+                onPressed: () => Navigator.of(
+                  context,
+                ).pop(_FrequencySelection(days: _days, times: _times)),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(76, 42),
+                  padding: const EdgeInsets.symmetric(horizontal: 18),
+                ),
+                child: const Text('完成'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          AnimatedSwitcher(
+            duration: appMotion(context, 160),
+            switchInCurve: Curves.easeOutCubic,
+            switchOutCurve: Curves.easeInCubic,
+            transitionBuilder: (child, animation) =>
+                FadeTransition(opacity: animation, child: child),
+            child: Text(
+              _summary,
+              key: ValueKey<String>(_summary),
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(color: AppPalette.pine),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(children: wheels),
+        ],
+      ),
+    );
+  }
+}
+
 enum _ItemFilter { active, ended, all }
 
 class ItemsPage extends StatefulWidget {
@@ -1851,6 +2727,7 @@ class ItemsPage extends StatefulWidget {
     required this.revision,
     required this.onAdd,
     required this.onEdit,
+    required this.onOpenSettings,
     required this.onDataChanged,
     super.key,
   });
@@ -1860,6 +2737,7 @@ class ItemsPage extends StatefulWidget {
   final int revision;
   final VoidCallback onAdd;
   final ValueChanged<ReminderItem> onEdit;
+  final VoidCallback onOpenSettings;
   final VoidCallback onDataChanged;
 
   @override
@@ -1908,7 +2786,8 @@ class _ItemsPageState extends State<ItemsPage> {
       () => _items = _items.where((entry) => entry.id != itemId).toList(),
     );
     try {
-      await widget.store.deleteItem(itemId);
+      final deleted = await widget.store.deleteItem(itemId);
+      if (deleted == null) throw StateError('Reminder no longer exists.');
       widget.onDataChanged();
       await widget.scheduler.sync(await widget.store.loadItems());
       if (!mounted) return;
@@ -1920,28 +2799,17 @@ class _ItemsPageState extends State<ItemsPage> {
           action: SnackBarAction(
             label: '撤销',
             onPressed: () async {
-              final restored = ReminderItem(
-                title: item.title,
-                iconKey: item.iconKey,
-                startDate: item.startDate,
-                endDate: item.endDate,
-                repeatKind: item.repeatKind,
-                weekdays: item.weekdays,
-                times: [
-                  for (var index = 0; index < item.times.length; index++)
-                    ReminderTime(
-                      minuteOfDay: item.times[index].minuteOfDay,
-                      sortOrder: index,
-                    ),
-                ],
-                snoozeMinutes: item.snoozeMinutes,
-                alertMonthBefore: item.alertMonthBefore,
-                alertWeekBefore: item.alertWeekBefore,
-              );
-              await widget.store.saveItem(restored);
-              await widget.scheduler.sync(await widget.store.loadItems());
-              widget.onDataChanged();
-              await _load();
+              try {
+                await widget.store.restoreDeletedItem(deleted);
+                await widget.scheduler.sync(await widget.store.loadItems());
+                widget.onDataChanged();
+                await _load();
+              } on Object {
+                if (!mounted) return;
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('未能恢复事项，请再试一次')));
+              }
             },
           ),
         ),
@@ -1979,6 +2847,13 @@ class _ItemsPageState extends State<ItemsPage> {
                   icon: Icons.add_rounded,
                   tooltip: '新建事项',
                   onPressed: widget.onAdd,
+                ),
+                const SizedBox(width: 8),
+                SoftIconButton(
+                  key: const Key('items-settings-button'),
+                  icon: Icons.settings_rounded,
+                  tooltip: '设置',
+                  onPressed: widget.onOpenSettings,
                 ),
               ],
             ),
@@ -2078,9 +2953,13 @@ class _ManagementItemCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ended = item.hasEnded || item.archived;
+    final inventoryLabel = inventoryStatusLabel(item);
+    final expiryLabel = expiryStatusLabel(item, DateTime.now());
     return Material(
       color: ended ? AppPalette.completedNote : AppPalette.canvasRaised,
       borderRadius: BorderRadius.circular(AppRadii.large),
+      elevation: ended ? 0 : 1,
+      shadowColor: AppPalette.pine.withValues(alpha: 0.13),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onEdit,
@@ -2124,6 +3003,27 @@ class _ManagementItemCard extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
+                    if (inventoryLabel != null || expiryLabel != null) ...[
+                      const SizedBox(height: 5),
+                      Text(
+                        [
+                          inventoryLabel,
+                          expiryLabel,
+                        ].whereType<String>().join(' · '),
+                        maxLines: 2,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color:
+                              (item.remainingQuantity ?? 1) <= 0 ||
+                                  (item.expiryDate != null &&
+                                      dateOnly(
+                                        item.expiryDate!,
+                                      ).isBefore(dateOnly(DateTime.now())))
+                              ? AppPalette.missed
+                              : AppPalette.pine,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 10),
                     Wrap(
                       spacing: 6,
@@ -2275,6 +3175,21 @@ class _SettingsPageState extends State<SettingsPage> {
     await _load();
   }
 
+  Future<void> _requestExactAlarmPermission() async {
+    final allowed = await widget.scheduler.requestExactAlarmPermission();
+    if (allowed) {
+      await widget.scheduler.sync(await widget.store.loadItems());
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(allowed ? '准时提醒已开启' : '未开启准时提醒，系统可能延迟事项通知'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+    await _load();
+  }
+
   Future<void> _testNotification() async {
     var allowed = _reminderHealth?.notificationsEnabled ?? false;
     if (!allowed) allowed = await widget.scheduler.requestPermission();
@@ -2302,141 +3217,169 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      bottom: false,
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(24, 24, 24, 36),
-        children: [
-          Text('设置', style: Theme.of(context).textTheme.headlineLarge),
-          const SizedBox(height: 24),
-          Row(
-            children: [
-              const Expanded(child: SectionLabel('提醒检查')),
-              TextButton.icon(
-                onPressed: _load,
-                icon: const Icon(Icons.refresh_rounded, size: 18),
-                label: const Text('重新检查'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          FormSurface(
-            padding: EdgeInsets.zero,
-            child: Column(
+    return Scaffold(
+      body: SafeArea(
+        bottom: false,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 36),
+          children: [
+            PageTopBar(title: '设置', onBack: () => Navigator.of(context).pop()),
+            const SizedBox(height: 12),
+            Row(
               children: [
-                ListTile(
-                  minTileHeight: 58,
-                  leading: const Icon(Icons.notifications_none_rounded),
-                  title: const Text('系统通知'),
-                  subtitle: Text(
-                    _reminderHealth == null
-                        ? '正在读取状态'
-                        : _reminderHealth!.notificationsEnabled
-                        ? '已允许'
-                        : '未允许',
-                  ),
-                  trailing: TextButton(
-                    onPressed: _reminderHealth?.notificationsEnabled == true
+                const Expanded(child: SectionLabel('提醒检查')),
+                TextButton.icon(
+                  onPressed: _load,
+                  icon: const Icon(Icons.refresh_rounded, size: 18),
+                  label: const Text('重新检查'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            FormSurface(
+              padding: EdgeInsets.zero,
+              child: Column(
+                children: [
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: const Icon(Icons.notifications_none_rounded),
+                    title: const Text('系统通知'),
+                    subtitle: Text(
+                      _reminderHealth == null
+                          ? '正在读取状态'
+                          : _reminderHealth!.notificationsEnabled
+                          ? '已允许'
+                          : '未允许',
+                    ),
+                    trailing: TextButton(
+                      onPressed: _reminderHealth?.notificationsEnabled == true
+                          ? widget.scheduler.openNotificationSettings
+                          : _requestPermission,
+                      child: Text(
+                        _reminderHealth?.notificationsEnabled == true
+                            ? '设置'
+                            : '开启',
+                      ),
+                    ),
+                    onTap: _reminderHealth?.notificationsEnabled == true
                         ? widget.scheduler.openNotificationSettings
                         : _requestPermission,
-                    child: Text(
-                      _reminderHealth?.notificationsEnabled == true
-                          ? '设置'
-                          : '开启',
+                  ),
+                  const Divider(indent: 16, endIndent: 16),
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: Icon(
+                      _reminderHealth?.exactAlarmAllowed == true
+                          ? Icons.alarm_on_rounded
+                          : Icons.alarm_off_rounded,
+                    ),
+                    title: const Text('准时提醒'),
+                    subtitle: Text(
+                      _reminderHealth == null
+                          ? '正在读取状态'
+                          : _reminderHealth!.exactAlarmAllowed
+                          ? '已允许，可按设定时间触发'
+                          : '未允许，系统可能延迟事项通知',
+                    ),
+                    trailing: _reminderHealth?.exactAlarmAllowed == true
+                        ? const Icon(Icons.check_rounded)
+                        : TextButton(
+                            onPressed: _requestExactAlarmPermission,
+                            child: const Text('开启'),
+                          ),
+                    onTap: _reminderHealth?.exactAlarmAllowed == true
+                        ? null
+                        : _requestExactAlarmPermission,
+                  ),
+                  const Divider(indent: 16, endIndent: 16),
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: Icon(
+                      _reminderHealth?.reminderChannelCanPopUp == true
+                          ? Icons.mark_chat_unread_outlined
+                          : Icons.comments_disabled_outlined,
+                    ),
+                    title: const Text('提醒弹窗渠道'),
+                    subtitle: Text(
+                      _reminderHealth == null
+                          ? '正在读取状态'
+                          : !_reminderHealth!.reminderChannelEnabled
+                          ? '渠道已关闭'
+                          : _reminderHealth!.reminderChannelCanPopUp
+                          ? '高优先级，可显示顶部提醒'
+                          : '当前可能只在通知栏静默显示',
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: widget.scheduler.openNotificationSettings,
+                  ),
+                  const Divider(indent: 16, endIndent: 16),
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: Icon(
+                      _reminderHealth?.batteryOptimizationIgnored == true
+                          ? Icons.battery_charging_full_rounded
+                          : Icons.battery_alert_outlined,
+                    ),
+                    title: const Text('后台运行'),
+                    subtitle: Text(
+                      _reminderHealth == null
+                          ? '正在读取状态'
+                          : _reminderHealth!.batteryOptimizationIgnored
+                          ? '未受电池优化限制'
+                          : '可能被电池优化延迟',
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: widget.scheduler.openBatterySettings,
+                  ),
+                  const Divider(indent: 16, endIndent: 16),
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: const Icon(Icons.schedule_outlined),
+                    title: const Text('已调度提醒'),
+                    subtitle: Text(_syncLabel(_reminderHealth?.lastSyncedAt)),
+                    trailing: Text(
+                      _reminderHealth == null
+                          ? '—'
+                          : '${_reminderHealth!.pendingCount} 条',
+                      style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ),
-                  onTap: _reminderHealth?.notificationsEnabled == true
-                      ? widget.scheduler.openNotificationSettings
-                      : _requestPermission,
-                ),
-                const Divider(indent: 16, endIndent: 16),
-                ListTile(
-                  minTileHeight: 58,
-                  leading: Icon(
-                    _reminderHealth?.reminderChannelCanPopUp == true
-                        ? Icons.mark_chat_unread_outlined
-                        : Icons.comments_disabled_outlined,
+                  const Divider(indent: 16, endIndent: 16),
+                  ListTile(
+                    minTileHeight: 58,
+                    leading: const Icon(Icons.notification_add_outlined),
+                    title: const Text('测试提醒'),
+                    subtitle: const Text('立即发送，包含“完成”和“稍后提醒”'),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: _testNotification,
                   ),
-                  title: const Text('提醒弹窗渠道'),
-                  subtitle: Text(
-                    _reminderHealth == null
-                        ? '正在读取状态'
-                        : !_reminderHealth!.reminderChannelEnabled
-                        ? '渠道已关闭'
-                        : _reminderHealth!.reminderChannelCanPopUp
-                        ? '高优先级，可显示顶部提醒'
-                        : '当前可能只在通知栏静默显示',
-                  ),
-                  trailing: const Icon(Icons.chevron_right_rounded),
-                  onTap: widget.scheduler.openNotificationSettings,
-                ),
-                const Divider(indent: 16, endIndent: 16),
-                ListTile(
-                  minTileHeight: 58,
-                  leading: Icon(
-                    _reminderHealth?.batteryOptimizationIgnored == true
-                        ? Icons.battery_charging_full_rounded
-                        : Icons.battery_alert_outlined,
-                  ),
-                  title: const Text('后台运行'),
-                  subtitle: Text(
-                    _reminderHealth == null
-                        ? '正在读取状态'
-                        : _reminderHealth!.batteryOptimizationIgnored
-                        ? '未受电池优化限制'
-                        : '可能被电池优化延迟',
-                  ),
-                  trailing: const Icon(Icons.chevron_right_rounded),
-                  onTap: widget.scheduler.openBatterySettings,
-                ),
-                const Divider(indent: 16, endIndent: 16),
-                ListTile(
-                  minTileHeight: 58,
-                  leading: const Icon(Icons.schedule_outlined),
-                  title: const Text('已调度提醒'),
-                  subtitle: Text(_syncLabel(_reminderHealth?.lastSyncedAt)),
-                  trailing: Text(
-                    _reminderHealth == null
-                        ? '—'
-                        : '${_reminderHealth!.pendingCount} 条',
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                ),
-                const Divider(indent: 16, endIndent: 16),
-                ListTile(
-                  minTileHeight: 58,
-                  leading: const Icon(Icons.notification_add_outlined),
-                  title: const Text('测试提醒'),
-                  subtitle: const Text('立即发送，包含“完成”和“稍后提醒”'),
-                  trailing: const Icon(Icons.chevron_right_rounded),
-                  onTap: _testNotification,
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 22),
-          const SectionLabel('本地数据'),
-          const SizedBox(height: 8),
-          FormSurface(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    _DataFigure(value: '$_itemCount', label: '事项'),
-                    const SizedBox(width: 28),
-                    _DataFigure(value: '$_completionCount', label: '完成记录'),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  '事项与完成记录只保存在这台设备的 SQLite 数据库中。',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
+            const SizedBox(height: 22),
+            const SectionLabel('本地数据'),
+            const SizedBox(height: 8),
+            FormSurface(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      _DataFigure(value: '$_itemCount', label: '事项'),
+                      const SizedBox(width: 28),
+                      _DataFigure(value: '$_completionCount', label: '完成记录'),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    '事项与完成记录只保存在这台设备的 SQLite 数据库中。',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -2514,6 +3457,8 @@ class SoftIconButton extends StatelessWidget {
     return Material(
       color: transparent ? Colors.transparent : AppPalette.field,
       shape: const CircleBorder(),
+      elevation: transparent ? 0 : 1,
+      shadowColor: AppPalette.pine.withValues(alpha: 0.14),
       child: IconButton(
         tooltip: tooltip,
         onPressed: onPressed,
@@ -2559,13 +3504,6 @@ class AppBottomNavigation extends StatelessWidget {
               selected: selectedIndex == 1,
               onTap: () => onSelected(1),
             ),
-            _BottomNavigationItem(
-              label: '设置',
-              icon: Icons.tune_rounded,
-              selectedIcon: Icons.tune_rounded,
-              selected: selectedIndex == 2,
-              onTap: () => onSelected(2),
-            ),
           ],
         ),
       ),
@@ -2597,11 +3535,28 @@ class _BottomNavigationItem extends StatelessWidget {
         selected: selected,
         label: label,
         child: InkWell(
-          onTap: onTap,
+          onTap: () {
+            HapticFeedback.selectionClick();
+            onTap();
+          },
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(selected ? selectedIcon : icon, color: color, size: 25),
+              AnimatedContainer(
+                duration: appMotion(context, 180),
+                curve: Curves.easeOutCubic,
+                width: 54,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: selected ? AppPalette.parentNote : Colors.transparent,
+                  borderRadius: BorderRadius.circular(AppRadii.pill),
+                ),
+                child: Icon(
+                  selected ? selectedIcon : icon,
+                  color: color,
+                  size: 24,
+                ),
+              ),
               const SizedBox(height: 3),
               Text(
                 label,
