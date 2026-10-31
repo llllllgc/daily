@@ -212,4 +212,61 @@ void main() {
       contains(completionKey(saved.id!, saved.times.single.id!, date)),
     );
   });
+
+  test('completion timestamps survive reload and deletion undo', () async {
+    final date = DateTime(2026, 10, 29);
+    final firstCompletion = DateTime(2026, 10, 29, 8);
+    final latestCompletion = DateTime(2026, 10, 29, 9);
+    final store = MemoryDailyStore(
+      seedItems: [
+        ReminderItem(
+          title: '药片',
+          iconKey: 'medication',
+          startDate: date,
+          repeatKind: RepeatKind.daily,
+          times: const [ReminderTime(minuteOfDay: 480, sortOrder: 0)],
+        ),
+      ],
+    );
+    final item = (await store.loadItems()).single;
+    final key = completionKey(item.id!, item.times.single.id!, date);
+    await store.setCompletion(
+      itemId: item.id!,
+      reminderTimeId: item.times.single.id!,
+      date: date,
+      completed: true,
+      completedAt: firstCompletion,
+    );
+    await store.setCompletion(
+      itemId: item.id!,
+      reminderTimeId: item.times.single.id!,
+      date: date,
+      completed: true,
+      completedAt: latestCompletion,
+    );
+    expect(await store.loadCompletionTimes(date, date), {key: firstCompletion});
+
+    final deleted = await store.deleteItem(item.id!);
+    await store.restoreDeletedItem(deleted!);
+    expect(await store.loadCompletionTimes(date, date), {key: firstCompletion});
+    final tomorrow = date.add(const Duration(days: 1));
+    expect(await store.loadCompletionTimes(tomorrow, tomorrow), isEmpty);
+
+    await store.setCompletion(
+      itemId: item.id!,
+      reminderTimeId: item.times.single.id!,
+      date: date,
+      completed: false,
+    );
+    await store.setCompletion(
+      itemId: item.id!,
+      reminderTimeId: item.times.single.id!,
+      date: date,
+      completed: true,
+      completedAt: latestCompletion,
+    );
+    expect(await store.loadCompletionTimes(date, date), {
+      key: latestCompletion,
+    });
+  });
 }

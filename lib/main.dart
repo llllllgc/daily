@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
@@ -11,6 +12,11 @@ import 'services/reminder_maintenance.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  LicenseRegistry.addLicense(() async* {
+    yield LicenseEntryWithLineBreaks([
+      'Lucide',
+    ], await rootBundle.loadString('assets/icons/LICENSE'));
+  });
   unawaited(initializeReminderMaintenance());
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
@@ -57,25 +63,26 @@ class _DailyBootstrapState extends State<DailyBootstrap> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Daily',
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.light,
-      home:
-          FutureBuilder<
-            ({SqliteDailyStore store, NotificationService scheduler})
-          >(
-            future: _initialization,
-            builder: (context, snapshot) {
-              final initialized = snapshot.data;
-              if (initialized == null) return const BrandedSplash();
-              return DailyShell(
-                store: initialized.store,
-                scheduler: initialized.scheduler,
-                refreshSignal: widget.refreshSignal,
-              );
-            },
-          ),
+    return FutureBuilder<
+      ({SqliteDailyStore store, NotificationService scheduler})
+    >(
+      future: _initialization,
+      builder: (context, snapshot) {
+        final initialized = snapshot.data;
+        if (initialized == null) {
+          return MaterialApp(
+            title: 'Daily',
+            debugShowCheckedModeBanner: false,
+            theme: AppTheme.light,
+            home: const BrandedSplash(),
+          );
+        }
+        return DailyApp(
+          store: initialized.store,
+          scheduler: initialized.scheduler,
+          refreshSignal: widget.refreshSignal,
+        );
+      },
     );
   }
 }

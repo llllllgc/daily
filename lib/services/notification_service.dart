@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui';
 
@@ -18,6 +17,8 @@ const _completeAction = 'complete';
 const _snoozeAction = 'snooze';
 const _reminderChannel = 'daily_reminders';
 const _cycleChannel = 'daily_cycle_alerts';
+const _reminderCategory = 'daily_reminder';
+const _snoozeCategory = 'daily_reminder_with_snooze';
 const _notificationActionPortName = 'daily.notification_action_refresh';
 const _completionChangedMessage = 'completion_changed';
 const _deviceSettingsChannel = MethodChannel('daily/device_settings');
@@ -192,6 +193,7 @@ class NotificationPayload {
     this.snoozeMinutes,
     this.kind = NotificationKind.scheduled,
     this.isTest = false,
+    this.isSnoozed = false,
   });
 
   final int itemId;
@@ -202,6 +204,7 @@ class NotificationPayload {
   final int? snoozeMinutes;
   final NotificationKind kind;
   final bool isTest;
+  final bool isSnoozed;
 
   String encode() => jsonEncode(<String, Object?>{
     'itemId': itemId,
@@ -212,6 +215,7 @@ class NotificationPayload {
     'snoozeMinutes': snoozeMinutes,
     'kind': kind.name,
     'isTest': isTest,
+    'isSnoozed': isSnoozed,
   });
 
   static NotificationPayload? decode(String? value) {
@@ -231,9 +235,16 @@ class NotificationPayload {
         timeLabel: map['timeLabel'] as String,
         snoozeMinutes: map['snoozeMinutes'] as int?,
         kind: kind.isEmpty
-            ? (isTest ? NotificationKind.test : NotificationKind.scheduled)
+            ? (isTest
+                  ? NotificationKind.test
+                  : (map['isSnoozed'] == true
+                        ? NotificationKind.snoozed
+                        : NotificationKind.scheduled))
             : kind.first,
         isTest: isTest,
+        isSnoozed:
+            (map['isSnoozed'] as bool? ?? false) ||
+            kindName == NotificationKind.snoozed.name,
       );
     } on Object {
       return null;
@@ -282,6 +293,15 @@ void notificationTapBackground(NotificationResponse response) async {
   }
 }
 
+typedef _ScheduledNotification = ({
+  int id,
+  String title,
+  String body,
+  tz.TZDateTime date,
+  NotificationDetails details,
+  String? payload,
+});
+
 class NotificationService implements ReminderScheduler {
   NotificationService({required this.store, this.refreshSignal});
 
@@ -292,6 +312,11 @@ class NotificationService implements ReminderScheduler {
   ReceivePort? _notificationActionPort;
   bool _initialized = false;
   DateTime? _lastSyncedAt;
+  Future<void> _syncQueue = Future<void>.value();
+
+  static bool get _isIOS => defaultTargetPlatform == TargetPlatform.iOS;
+  static bool get _isAndroid => defaultTargetPlatform == TargetPlatform.android;
+  static bool get _isSupported => !kIsWeb && (_isAndroid || _isIOS);
 
   static const _reminderChannelSpec = AndroidNotificationChannel(
     _reminderChannel,
@@ -307,12 +332,34 @@ class NotificationService implements ReminderScheduler {
     importance: Importance.high,
   );
 
-  static const _initializationSettings = InitializationSettings(
+  static final _initializationSettings = InitializationSettings(
     android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    iOS: DarwinInitializationSettings(
+      requestAlertPermission: false,
+      requestBadgePermission: false,
+      requestSoundPermission: false,
+      notificationCategories: [
+        DarwinNotificationCategory(
+          _reminderCategory,
+          actions: [DarwinNotificationAction.plain(_completeAction, '完成')],
+        ),
+        DarwinNotificationCategory(
+          _snoozeCategory,
+          actions: [
+            DarwinNotificationAction.plain(_completeAction, '完成'),
+            DarwinNotificationAction.plain(_snoozeAction, '稍后提醒'),
+          ],
+        ),
+      ],
+    ),
   );
 
   static NotificationDetails _reminderDetails({required bool allowSnooze}) {
     return NotificationDetails(
+      iOS: DarwinNotificationDetails(
+        categoryIdentifier: allowSnooze ? _snoozeCategory : _reminderCategory,
+        threadIdentifier: _reminderChannel,
+      ),
       android: AndroidNotificationDetails(
         _reminderChannel,
         '事项提醒',
@@ -340,6 +387,7 @@ class NotificationService implements ReminderScheduler {
   }
 
   static const _cycleDetails = NotificationDetails(
+    iOS: DarwinNotificationDetails(threadIdentifier: _cycleChannel),
     android: AndroidNotificationDetails(
       _cycleChannel,
       '周期结束提醒',
@@ -352,7 +400,7 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<void> initialize() async {
-    if (_initialized || kIsWeb || !Platform.isAndroid) return;
+    if (_initialized || !_isSupported) return;
     _registerNotificationActionPort();
     await _configureTimezone();
     await _plugin.initialize(
@@ -404,8 +452,16 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<bool> requestPermission() async {
-    if (kIsWeb || !Platform.isAndroid) return true;
+    if (!_isSupported) return true;
     await initialize();
+    if (_isIOS) {
+      return await _plugin
+              .resolvePlatformSpecificImplementation<
+                IOSFlutterLocalNotificationsPlugin
+              >()
+              ?.requestPermissions(alert: true, sound: true) ??
+          false;
+    }
     return await _plugin
             .resolvePlatformSpecificImplementation<
               AndroidFlutterLocalNotificationsPlugin
@@ -416,7 +472,7 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<bool> requestExactAlarmPermission() async {
-    if (kIsWeb || !Platform.isAndroid) return true;
+    if (kIsWeb || !_isAndroid) return true;
     await initialize();
     return await _plugin
             .resolvePlatformSpecificImplementation<
@@ -428,8 +484,16 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<bool> areNotificationsEnabled() async {
-    if (kIsWeb || !Platform.isAndroid) return true;
+    if (!_isSupported) return true;
     await initialize();
+    if (_isIOS) {
+      final permissions = await _plugin
+          .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin
+          >()
+          ?.checkPermissions();
+      return permissions?.isEnabled ?? false;
+    }
     return await _plugin
             .resolvePlatformSpecificImplementation<
               AndroidFlutterLocalNotificationsPlugin
@@ -440,7 +504,7 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<ReminderHealth> health() async {
-    if (kIsWeb || !Platform.isAndroid) {
+    if (!_isSupported) {
       return ReminderHealth(
         notificationsEnabled: true,
         exactAlarmAllowed: true,
@@ -452,6 +516,23 @@ class NotificationService implements ReminderScheduler {
       );
     }
     await initialize();
+    if (_isIOS) {
+      final permissions = await _plugin
+          .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin
+          >()
+          ?.checkPermissions();
+      final pending = await _plugin.pendingNotificationRequests();
+      return ReminderHealth(
+        notificationsEnabled: permissions?.isEnabled ?? false,
+        exactAlarmAllowed: true,
+        reminderChannelEnabled: permissions?.isEnabled ?? false,
+        reminderChannelCanPopUp: permissions?.isAlertEnabled ?? false,
+        batteryOptimizationIgnored: true,
+        pendingCount: pending.length,
+        lastSyncedAt: _lastSyncedAt,
+      );
+    }
     final android = _plugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
@@ -493,8 +574,16 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<void> openNotificationSettings() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (!_isSupported) return;
     await initialize();
+    if (_isIOS) {
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin
+          >()
+          ?.openAppNotificationSettings();
+      return;
+    }
     await _plugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
@@ -504,7 +593,7 @@ class NotificationService implements ReminderScheduler {
 
   @override
   Future<void> openBatterySettings() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (kIsWeb || !_isAndroid) return;
     try {
       await _deviceSettingsChannel.invokeMethod<void>('openBatterySettings');
     } on PlatformException {
@@ -513,9 +602,18 @@ class NotificationService implements ReminderScheduler {
   }
 
   @override
-  Future<void> sync(List<ReminderItem> items) async {
-    if (kIsWeb || !Platform.isAndroid) return;
+  Future<void> sync(List<ReminderItem> items) {
+    _syncQueue = _syncQueue.catchError((Object _) {}).then((_) => _sync(items));
+    return _syncQueue;
+  }
+
+  Future<void> _sync(List<ReminderItem> items) async {
+    if (!_isSupported) return;
     await initialize();
+    if (_isIOS) {
+      await _syncIOS(items);
+      return;
+    }
     final now = tz.TZDateTime.now(tz.local);
     final android = _plugin
         .resolvePlatformSpecificImplementation<
@@ -656,9 +754,132 @@ class NotificationService implements ReminderScheduler {
     return plan.take(notificationSchedulingLimit).toList(growable: false);
   }
 
+  Future<void> _syncIOS(List<ReminderItem> items) async {
+    if (!_isSupported) return;
+    await initialize();
+    final pending = await _plugin.pendingNotificationRequests();
+    var snoozedCount = 0;
+    for (final notification in pending) {
+      final payload = NotificationPayload.decode(notification.payload);
+      final keepSnooze =
+          payload != null &&
+          payload.isSnoozed &&
+          (payload.isTest ||
+              items.any(
+                (item) =>
+                    item.id == payload.itemId &&
+                    item.isScheduledOn(payload.date) &&
+                    item.times.any((time) => time.id == payload.reminderTimeId),
+              ));
+      if (keepSnooze) {
+        snoozedCount++;
+      } else {
+        await _plugin.cancel(id: notification.id);
+      }
+    }
+
+    final now = tz.TZDateTime.now(tz.local);
+    final firstDay = DateTime(now.year, now.month, now.day);
+    final schedule = <_ScheduledNotification>[];
+    for (var offset = 0; offset <= 30; offset++) {
+      final date = firstDay.add(Duration(days: offset));
+      for (final item in items.where((entry) => entry.isScheduledOn(date))) {
+        final itemId = item.id;
+        if (itemId == null) continue;
+        for (final time in item.times) {
+          final timeId = time.id;
+          if (timeId == null) continue;
+          final scheduledDate = tz.TZDateTime(
+            tz.local,
+            date.year,
+            date.month,
+            date.day,
+            time.hour,
+            time.minute,
+          );
+          if (!scheduledDate.isAfter(now.add(const Duration(seconds: 5)))) {
+            continue;
+          }
+          final payload = NotificationPayload(
+            itemId: itemId,
+            reminderTimeId: timeId,
+            date: date,
+            title: item.title,
+            timeLabel: time.label,
+            snoozeMinutes: item.snoozeMinutes,
+          );
+          schedule.add((
+            id: _notificationId(itemId, timeId, date),
+            title: item.title,
+            body: item.times.length == 1
+                ? '现在可以完成这件事了'
+                : '第 ${time.sortOrder + 1} 次 · ${time.label}',
+            date: scheduledDate,
+            details: _reminderDetails(allowSnooze: item.snoozeMinutes != null),
+            payload: payload.encode(),
+          ));
+        }
+      }
+    }
+
+    for (final item in items) {
+      schedule.addAll(_iosCycleAlerts(item, now));
+    }
+    schedule.sort((a, b) => a.date.compareTo(b.date));
+    // iOS retains at most 64 pending requests. Leave room for snoozes and
+    // include cycle alerts in the same budget so they cannot evict reminders.
+    final limit = _isIOS ? (64 - snoozedCount).clamp(0, 60) : 96;
+    for (final notification in schedule.take(limit)) {
+      await _plugin.zonedSchedule(
+        id: notification.id,
+        title: notification.title,
+        body: notification.body,
+        scheduledDate: notification.date,
+        notificationDetails: notification.details,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        payload: notification.payload,
+      );
+    }
+    _lastSyncedAt = DateTime.now();
+  }
+
+  Iterable<_ScheduledNotification> _iosCycleAlerts(
+    ReminderItem item,
+    tz.TZDateTime now,
+  ) sync* {
+    final end = item.endDate;
+    final itemId = item.id;
+    if (end == null || itemId == null) return;
+    final alerts = <(DateTime, String, int)>[];
+    if (item.alertMonthBefore) {
+      alerts.add((_monthBefore(end), '还有一个月结束', 31));
+    }
+    if (item.alertWeekBefore) {
+      alerts.add((end.subtract(const Duration(days: 7)), '还有一周结束', 7));
+    }
+    for (final (date, label, salt) in alerts) {
+      final scheduledDate = tz.TZDateTime(
+        tz.local,
+        date.year,
+        date.month,
+        date.day,
+        9,
+      );
+      if (!scheduledDate.isAfter(now)) continue;
+      yield (
+        id: _cycleNotificationId(itemId, salt),
+        title: item.title,
+        body: '$label · 只作提醒，不会替你更改事项',
+        date: scheduledDate,
+        details: _cycleDetails,
+        payload: null,
+      );
+    }
+  }
+
   @override
   Future<void> showTestNotification() async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (!_isSupported) return;
     await initialize();
     final now = DateTime.now();
     final payload = NotificationPayload(
@@ -682,7 +903,7 @@ class NotificationService implements ReminderScheduler {
   }
 
   static Future<void> scheduleSnooze(NotificationPayload payload) async {
-    if (kIsWeb || !Platform.isAndroid) return;
+    if (!_isSupported || payload.snoozeMinutes == null) return;
     await _configureTimezone();
     final plugin = FlutterLocalNotificationsPlugin();
     await plugin.initialize(settings: _initializationSettings);
@@ -704,6 +925,7 @@ class NotificationService implements ReminderScheduler {
       snoozeMinutes: payload.snoozeMinutes,
       kind: NotificationKind.snoozed,
       isTest: payload.isTest,
+      isSnoozed: true,
     );
     await plugin.zonedSchedule(
       id:

@@ -2,6 +2,19 @@ import 'dart:async';
 
 enum RepeatKind { daily, weekly, interval }
 
+enum DailyThemeColor {
+  sage('苔绿'),
+  blue('雾蓝'),
+  apricot('暖杏'),
+  lavender('灰紫');
+
+  const DailyThemeColor(this.label);
+  final String label;
+
+  static DailyThemeColor fromName(String? value) =>
+      values.firstWhere((theme) => theme.name == value, orElse: () => sage);
+}
+
 enum DayRecordStatus { none, pending, partial, complete, missed }
 
 DayRecordStatus dayRecordStatus({
@@ -226,11 +239,13 @@ class DayTaskGroup {
     required this.item,
     required this.date,
     required this.completedKeys,
+    this.completionTimes = const {},
   });
 
   final ReminderItem item;
   final DateTime date;
   final Set<String> completedKeys;
+  final Map<String, DateTime> completionTimes;
 
   List<ReminderTime> get orderedTimes {
     final result = List<ReminderTime>.from(item.times);
@@ -238,6 +253,14 @@ class DayTaskGroup {
       final aDone = isCompleted(a);
       final bDone = isCompleted(b);
       if (aDone != bDone) return aDone ? 1 : -1;
+      if (aDone) {
+        final aCompletedAt = completedAt(a);
+        final bCompletedAt = completedAt(b);
+        if (aCompletedAt != null && bCompletedAt != null) {
+          final completionOrder = bCompletedAt.compareTo(aCompletedAt);
+          if (completionOrder != 0) return completionOrder;
+        }
+      }
       final order = a.sortOrder.compareTo(b.sortOrder);
       return order != 0 ? order : a.minuteOfDay.compareTo(b.minuteOfDay);
     });
@@ -249,6 +272,24 @@ class DayTaskGroup {
     final timeId = time.id;
     if (itemId == null || timeId == null) return false;
     return completedKeys.contains(completionKey(itemId, timeId, date));
+  }
+
+  DateTime? completedAt(ReminderTime time) {
+    final itemId = item.id;
+    final timeId = time.id;
+    if (itemId == null || timeId == null) return null;
+    return completionTimes[completionKey(itemId, timeId, date)];
+  }
+
+  DateTime? get lastCompletedAt {
+    DateTime? latest;
+    for (final time in item.times.where(isCompleted)) {
+      final timestamp = completedAt(time);
+      if (timestamp != null && (latest == null || timestamp.isAfter(latest))) {
+        latest = timestamp;
+      }
+    }
+    return latest;
   }
 
   int get completedCount => item.times.where(isCompleted).length;
@@ -280,6 +321,10 @@ class DeletedReminder {
 abstract class DailyStore {
   Future<void> initialize();
 
+  Future<DailyThemeColor> loadThemeColor();
+
+  Future<void> saveThemeColor(DailyThemeColor color);
+
   Future<List<ReminderItem>> loadItems({bool includeArchived = false});
 
   Future<ReminderItem> saveItem(ReminderItem item);
@@ -293,9 +338,12 @@ abstract class DailyStore {
     required int reminderTimeId,
     required DateTime date,
     required bool completed,
+    DateTime? completedAt,
   });
 
   Future<Set<String>> loadCompletionKeys(DateTime from, DateTime to);
+
+  Future<Map<String, DateTime>> loadCompletionTimes(DateTime from, DateTime to);
 
   Future<int> completionCount();
 }
@@ -309,9 +357,17 @@ class MemoryDailyStore implements DailyStore {
   }
 
   final List<ReminderItem> _items;
-  final Map<String, double> _completions = <String, double>{};
+  final Map<String, DeletedCompletion> _completions = {};
   int _nextItemId = 1;
   int _nextTimeId = 1;
+  DailyThemeColor _themeColor = DailyThemeColor.sage;
+
+  @override
+  Future<DailyThemeColor> loadThemeColor() async => _themeColor;
+
+  @override
+  Future<void> saveThemeColor(DailyThemeColor color) async =>
+      _themeColor = color;
 
   @override
   Future<void> initialize() async {}
@@ -360,13 +416,13 @@ class MemoryDailyStore implements DailyStore {
           .where((id) => !retainedIds.contains(id))
           .toSet();
       var removedUsage = 0.0;
-      _completions.removeWhere((key, quantity) {
+      _completions.removeWhere((key, completion) {
         final parts = key.split(':');
         final remove =
             parts.length == 3 &&
             int.tryParse(parts[0]) == item.id &&
             removedIds.contains(int.tryParse(parts[1]));
-        if (remove) removedUsage += quantity;
+        if (remove) removedUsage += completion.quantityUsed;
         return remove;
       });
       saved = saved.copyWith(
@@ -395,14 +451,7 @@ class MemoryDailyStore implements DailyStore {
       if (parts.length != 3 || int.tryParse(parts[0]) != itemId) continue;
       final reminderTimeId = int.tryParse(parts[1]);
       if (reminderTimeId == null || !timeIds.contains(reminderTimeId)) continue;
-      completions.add(
-        DeletedCompletion(
-          reminderTimeId: reminderTimeId,
-          date: parseDay(parts[2]),
-          completedAt: DateTime.now(),
-          quantityUsed: _completions[key] ?? 0,
-        ),
-      );
+      completions.add(_completions[key]!);
     }
     _items.removeWhere((item) => item.id == itemId);
     _completions.removeWhere((key, _) {
@@ -423,7 +472,7 @@ class MemoryDailyStore implements DailyStore {
             completion.reminderTimeId,
             completion.date,
           )] =
-          completion.quantityUsed;
+          completion;
     }
   }
 
@@ -433,12 +482,18 @@ class MemoryDailyStore implements DailyStore {
     required int reminderTimeId,
     required DateTime date,
     required bool completed,
+    DateTime? completedAt,
   }) async {
     final key = completionKey(itemId, reminderTimeId, date);
     if (completed) {
       if (_completions.containsKey(key)) return;
       final item = _items.where((entry) => entry.id == itemId).first;
-      _completions[key] = item.stockQuantity == null ? 0 : item.doseQuantity;
+      _completions[key] = DeletedCompletion(
+        reminderTimeId: reminderTimeId,
+        date: dateOnly(date),
+        completedAt: completedAt ?? DateTime.now(),
+        quantityUsed: item.stockQuantity == null ? 0 : item.doseQuantity,
+      );
     } else {
       _completions.remove(key);
     }
@@ -446,12 +501,22 @@ class MemoryDailyStore implements DailyStore {
 
   @override
   Future<Set<String>> loadCompletionKeys(DateTime from, DateTime to) async {
+    return (await loadCompletionTimes(from, to)).keys.toSet();
+  }
+
+  @override
+  Future<Map<String, DateTime>> loadCompletionTimes(
+    DateTime from,
+    DateTime to,
+  ) async {
     final start = dayKey(from);
     final end = dayKey(to);
-    return _completions.keys.where((key) {
-      final date = key.split(':').last;
-      return date.compareTo(start) >= 0 && date.compareTo(end) <= 0;
-    }).toSet();
+    return {
+      for (final entry in _completions.entries)
+        if (dayKey(entry.value.date).compareTo(start) >= 0 &&
+            dayKey(entry.value.date).compareTo(end) <= 0)
+          entry.key: entry.value.completedAt,
+    };
   }
 
   @override
@@ -459,7 +524,7 @@ class MemoryDailyStore implements DailyStore {
 
   double _usedQuantity(int itemId) => _completions.entries
       .where((entry) => entry.key.startsWith('$itemId:'))
-      .fold(0, (sum, entry) => sum + entry.value);
+      .fold(0, (sum, entry) => sum + entry.value.quantityUsed);
 }
 
 class AppRefreshSignal {

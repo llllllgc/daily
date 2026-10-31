@@ -18,9 +18,12 @@ class SqliteDailyStore implements DailyStore {
     final root = await getDatabasesPath();
     _database = await openDatabase(
       path.join(root, 'daily.sqlite3'),
-      version: 2,
+      version: 3,
       onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
       onCreate: (db, version) async {
+        await db.execute(
+          'CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+        );
         await db.execute('''
           CREATE TABLE items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +77,11 @@ class SqliteDailyStore implements DailyStore {
         );
       },
       onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 3) {
+          await db.execute(
+            'CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+          );
+        }
         if (oldVersion < 2) {
           await db.execute(
             'ALTER TABLE items ADD COLUMN interval_days INTEGER NOT NULL DEFAULT 2',
@@ -96,6 +104,26 @@ class SqliteDailyStore implements DailyStore {
         }
       },
     );
+  }
+
+  @override
+  Future<DailyThemeColor> loadThemeColor() async {
+    final db = await database;
+    final rows = await db.query(
+      'app_settings',
+      where: 'key = ?',
+      whereArgs: ['theme_color'],
+    );
+    return DailyThemeColor.fromName(rows.firstOrNull?['value'] as String?);
+  }
+
+  @override
+  Future<void> saveThemeColor(DailyThemeColor color) async {
+    final db = await database;
+    await db.insert('app_settings', {
+      'key': 'theme_color',
+      'value': color.name,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   @override
@@ -306,6 +334,7 @@ class SqliteDailyStore implements DailyStore {
     required int reminderTimeId,
     required DateTime date,
     required bool completed,
+    DateTime? completedAt,
   }) async {
     final db = await database;
     final where =
@@ -328,7 +357,7 @@ class SqliteDailyStore implements DailyStore {
         'item_id': itemId,
         'reminder_time_id': reminderTimeId,
         'occurrence_date': dayKey(date),
-        'completed_at': DateTime.now().toIso8601String(),
+        'completed_at': (completedAt ?? DateTime.now()).toIso8601String(),
         'quantity_used': item['stock_quantity'] == null
             ? 0
             : (item['dose_quantity'] as num).toDouble(),
@@ -338,19 +367,31 @@ class SqliteDailyStore implements DailyStore {
 
   @override
   Future<Set<String>> loadCompletionKeys(DateTime from, DateTime to) async {
+    return (await loadCompletionTimes(from, to)).keys.toSet();
+  }
+
+  @override
+  Future<Map<String, DateTime>> loadCompletionTimes(
+    DateTime from,
+    DateTime to,
+  ) async {
     final db = await database;
     final rows = await db.query(
       'completions',
-      columns: ['item_id', 'reminder_time_id', 'occurrence_date'],
+      columns: [
+        'item_id',
+        'reminder_time_id',
+        'occurrence_date',
+        'completed_at',
+      ],
       where: 'occurrence_date >= ? AND occurrence_date <= ?',
       whereArgs: [dayKey(from), dayKey(to)],
     );
-    return rows
-        .map(
-          (row) =>
-              '${row['item_id']}:${row['reminder_time_id']}:${row['occurrence_date']}',
-        )
-        .toSet();
+    return {
+      for (final row in rows)
+        '${row['item_id']}:${row['reminder_time_id']}:${row['occurrence_date']}':
+            DateTime.parse(row['completed_at'] as String),
+    };
   }
 
   @override
