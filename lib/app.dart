@@ -18,6 +18,7 @@ import 'services/notification_service.dart';
 import 'theme.dart';
 import 'item_icons.dart';
 import 'widgets/item_icon.dart';
+import 'widgets/completion_progress_ring.dart';
 import 'widgets/motion.dart';
 
 export 'widgets/motion.dart' show appMotion;
@@ -1443,19 +1444,6 @@ class DailySummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final status = dayRecordStatus(
-      date: date,
-      today: DateTime.now(),
-      completed: completed,
-      total: total,
-    );
-    final summary = switch (status) {
-      DayRecordStatus.none => total == 0 ? '暂无事项' : '计划 $total 次',
-      DayRecordStatus.pending => '待记录 $total 次',
-      DayRecordStatus.partial => '$completed / $total 已记录',
-      DayRecordStatus.complete => '$completed / $total 已完成',
-      DayRecordStatus.missed => '遗漏 ${total - completed} 次',
-    };
     return Container(
       constraints: const BoxConstraints(minHeight: 58),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -1471,13 +1459,15 @@ class DailySummary extends StatelessWidget {
               style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
-          Text(
-            summary,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: context.palette.muted,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
+          if (total > 0)
+            CompletionProgressRing(
+              key: ValueKey('daily-progress-${dayKey(date)}'),
+              completed: completed,
+              total: total,
+              semanticLabel: '当天完成进度',
+            )
+          else
+            Text('暂无事项', style: Theme.of(context).textTheme.bodyMedium),
         ],
       ),
     );
@@ -1630,17 +1620,11 @@ class TaskGroupView extends StatelessWidget {
                         ),
                       ),
                       if (isMultiple) ...[
-                        Text(
-                          '${group.completedCount} / ${group.item.times.length}',
-                          style: Theme.of(context).textTheme.bodyLarge
-                              ?.copyWith(
-                                fontFeatures: const [
-                                  FontFeature.tabularFigures(),
-                                ],
-                                color: parentCompleted
-                                    ? context.palette.muted
-                                    : context.palette.ink,
-                              ),
+                        CompletionProgressRing(
+                          key: ValueKey('group-progress-${group.item.id}'),
+                          completed: group.completedCount,
+                          total: group.item.times.length,
+                          semanticLabel: '${group.item.title}完成进度',
                         ),
                         SizedBox(
                           width: 44,
@@ -3321,11 +3305,11 @@ class _ItemCategoryPicker extends StatelessWidget {
     shrinkWrap: true,
     physics: const NeverScrollableScrollPhysics(),
     padding: EdgeInsets.zero,
-    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
       crossAxisCount: 4,
       mainAxisSpacing: 7,
       crossAxisSpacing: 7,
-      mainAxisExtent: 64 + MediaQuery.textScalerOf(context).scale(12) - 12,
+      mainAxisExtent: 56,
     ),
     children: [
       for (final category in ItemIcons.categories)
@@ -3380,38 +3364,29 @@ class _ItemIconTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Semantics(
+    label: label,
     selected: selected,
     button: true,
-    child: Material(
-      color: selected
-          ? context.palette.parentNote
-          : context.palette.canvasRaised,
-      borderRadius: BorderRadius.circular(15),
-      child: InkWell(
-        onTap: onTap,
+    child: Tooltip(
+      message: label,
+      excludeFromSemantics: true,
+      child: Material(
+        color: selected
+            ? context.palette.parentNote
+            : context.palette.canvasRaised,
         borderRadius: BorderRadius.circular(15),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              DailyItemIcon(
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(15),
+          child: SizedBox(
+            height: 56,
+            child: Center(
+              child: DailyItemIcon(
                 iconKey,
                 size: 24,
                 color: selected ? context.palette.pine : context.palette.muted,
               ),
-              const SizedBox(height: 5),
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: selected
-                      ? context.palette.pine
-                      : context.palette.muted,
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -4958,7 +4933,7 @@ class AppBottomNavigation extends StatelessWidget {
     return SafeArea(
       top: false,
       child: Container(
-        height: 72,
+        height: 64,
         decoration: BoxDecoration(
           color: context.palette.canvas,
           border: Border(top: BorderSide(color: context.palette.rule)),
@@ -4966,6 +4941,7 @@ class AppBottomNavigation extends StatelessWidget {
         child: Row(
           children: [
             _BottomNavigationItem(
+              key: const Key('tab-calendar'),
               label: '日历',
               icon: Icons.calendar_month_outlined,
               selectedIcon: Icons.calendar_month_rounded,
@@ -4973,6 +4949,7 @@ class AppBottomNavigation extends StatelessWidget {
               onTap: () => onSelected(0),
             ),
             _BottomNavigationItem(
+              key: const Key('tab-items'),
               label: '事项',
               icon: Icons.format_list_bulleted_rounded,
               selectedIcon: Icons.format_list_bulleted_rounded,
@@ -4993,6 +4970,7 @@ class _BottomNavigationItem extends StatelessWidget {
     required this.selectedIcon,
     required this.selected,
     required this.onTap,
+    super.key,
   });
 
   final String label;
@@ -5009,19 +4987,20 @@ class _BottomNavigationItem extends StatelessWidget {
         button: true,
         selected: selected,
         label: label,
-        child: InkWell(
-          onTap: () {
-            HapticFeedback.selectionClick();
-            onTap();
-          },
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              AnimatedContainer(
+        child: Tooltip(
+          message: label,
+          excludeFromSemantics: true,
+          child: InkWell(
+            onTap: () {
+              HapticFeedback.selectionClick();
+              onTap();
+            },
+            child: Center(
+              child: AnimatedContainer(
                 duration: appMotion(context, 180),
                 curve: Curves.easeOutCubic,
                 width: 54,
-                height: 32,
+                height: 38,
                 decoration: BoxDecoration(
                   color: selected
                       ? context.palette.parentNote
@@ -5034,16 +5013,7 @@ class _BottomNavigationItem extends StatelessWidget {
                   size: 24,
                 ),
               ),
-              const SizedBox(height: 3),
-              Text(
-                label,
-                style: TextStyle(
-                  color: color,
-                  fontSize: 12,
-                  fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),

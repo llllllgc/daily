@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:daily/app.dart';
 import 'package:daily/models.dart';
 import 'package:daily/services/notification_service.dart';
+import 'package:daily/widgets/completion_progress_ring.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -130,6 +131,110 @@ Future<void> enterTime(WidgetTester tester, String hour, String minute) async {
 }
 
 void main() {
+  testWidgets(
+    'navigation and editor icon tiles keep labels in semantics only',
+    (tester) async {
+      await setPhoneSize(tester);
+      await pumpDaily(tester, MemoryDailyStore());
+      expect(
+        find.descendant(
+          of: find.byType(AppBottomNavigation),
+          matching: find.byType(Text),
+        ),
+        findsNothing,
+      );
+      expect(find.byTooltip('日历'), findsOneWidget);
+      expect(find.byTooltip('事项'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('tab-items')));
+      await tester.pumpAndSettle();
+      expect(find.byType(ItemsPage), findsOneWidget);
+      await tester.tap(find.byKey(const Key('tab-calendar')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('add-item-button')));
+      await tester.pumpAndSettle();
+      final category = find.byKey(const ValueKey('icon-vitamin'));
+      expect(
+        find.descendant(of: category, matching: find.byType(Text)),
+        findsNothing,
+      );
+      expect(find.byTooltip('营养'), findsOneWidget);
+      await tester.tap(category);
+      await tester.tap(find.byKey(const Key('editor-icon-settings')));
+      await tester.pumpAndSettle();
+      final icon = find.byKey(const ValueKey('item-icon-vitamin'));
+      // Both the category tiles and the individual icon tiles are icon-only.
+      expect(icon, findsOneWidget);
+      expect(
+        find.descendant(of: icon, matching: find.byType(Text)),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('daily and item rings track every dose completion and undo', (
+    tester,
+  ) async {
+    await setPhoneSize(tester);
+    final today = dateOnly(DateTime.now());
+    final store = MemoryDailyStore(
+      seedItems: [
+        groupedItem(today).copyWith(
+          times: [
+            for (var index = 0; index < 4; index++)
+              ReminderTime(minuteOfDay: (8 + index * 3) * 60, sortOrder: index),
+          ],
+        ),
+      ],
+    );
+    final item = (await store.loadItems()).single;
+    await pumpDaily(tester, store);
+    await tester.tap(find.text('感冒药'));
+    await tester.pumpAndSettle();
+    final indicators = find.descendant(
+      of: find.byType(CompletionProgressRing),
+      matching: find.byType(CircularProgressIndicator),
+    );
+    for (var count = 0; count <= 4; count++) {
+      expect(indicators, findsNWidgets(2));
+      for (final indicator in tester.widgetList<CircularProgressIndicator>(
+        indicators,
+      )) {
+        expect(indicator.value, count / 4);
+        expect(
+          indicator.color,
+          count < 2
+              ? CompletionProgressRing.lowColor
+              : count < 4
+              ? CompletionProgressRing.partialColor
+              : CompletionProgressRing.completeColor,
+        );
+      }
+      if (count == 4) break;
+      final row = find.byKey(ValueKey('dose-${item.times[count].id}'));
+      await tester.tap(
+        find.descendant(of: row, matching: find.byType(CompletionButton)),
+      );
+      await tester.pumpAndSettle();
+    }
+    // The completion control intentionally rejects repeated taps for 550 ms.
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 560)),
+    );
+    final row = find.byKey(ValueKey('dose-${item.times.last.id}'));
+    await tester.tap(
+      find.descendant(of: row, matching: find.byType(CompletionButton)),
+    );
+    await tester.pumpAndSettle();
+    for (final indicator in tester.widgetList<CircularProgressIndicator>(
+      indicators,
+    )) {
+      expect(indicator.value, .75);
+      expect(indicator.color, CompletionProgressRing.partialColor);
+    }
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'week view fits four tasks and month expansion preserves their order',
     (tester) async {
@@ -537,20 +642,20 @@ void main() {
     final offset = tester.state<ScrollableState>(scrollable).position.pixels;
     expect(offset, greaterThan(0));
 
-    await tester.tap(find.text('事项'));
+    await tester.tap(find.byKey(const Key('tab-items')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('item-filter-all')));
     await tester.pumpAndSettle();
     final indicator = find.byKey(const Key('item-filter-indicator'));
     final selectedX = tester.getTopLeft(indicator).dx;
-    await tester.tap(find.text('日历'));
+    await tester.tap(find.byKey(const Key('tab-calendar')));
     await tester.pumpAndSettle();
     expect(find.byType(DoseRow), findsNWidgets(3));
     expect(
       tester.state<ScrollableState>(scrollable).position.pixels,
       closeTo(offset, 0.1),
     );
-    await tester.tap(find.text('事项'));
+    await tester.tap(find.byKey(const Key('tab-items')));
     await tester.pumpAndSettle();
     expect(tester.getTopLeft(indicator).dx, closeTo(selectedX, 0.1));
     expect(tester.takeException(), isNull);
@@ -910,7 +1015,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('已完成“维生素 D”'), findsOneWidget);
 
-    await tester.tap(find.text('事项'));
+    await tester.tap(find.byKey(const Key('tab-items')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
 
@@ -940,7 +1045,7 @@ void main() {
 
     await tester.tap(find.byIcon(Icons.arrow_back_ios_new_rounded));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('事项'));
+    await tester.tap(find.byKey(const Key('tab-items')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('items-settings-button')), findsOneWidget);
 
@@ -964,7 +1069,7 @@ void main() {
     );
     await pumpDaily(tester, store);
 
-    await tester.tap(find.text('事项'));
+    await tester.tap(find.byKey(const Key('tab-items')));
     await tester.pumpAndSettle();
     await tester.tap(find.byType(PopupMenuButton<String>));
     await tester.pumpAndSettle();
@@ -1258,7 +1363,7 @@ void main() {
       expect(scheduler.lastSynced.single.times.single.minuteOfDay, 630);
       expect(find.byType(ItemEditorPage), findsNothing);
 
-      await tester.tap(find.text('事项'));
+      await tester.tap(find.byKey(const Key('tab-items')));
       await tester.pumpAndSettle();
       await tester.tap(
         find.byKey(
@@ -1345,7 +1450,7 @@ void main() {
       final store = MemoryDailyStore(seedItems: [seed]);
       final original = (await store.loadItems()).single;
       await pumpDaily(tester, store);
-      await tester.tap(find.text('事项'));
+      await tester.tap(find.byKey(const Key('tab-items')));
       await tester.pumpAndSettle();
       await tester.tap(find.text('感冒药'));
       await tester.pumpAndSettle();
