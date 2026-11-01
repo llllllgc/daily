@@ -4,6 +4,8 @@ import 'package:daily/app.dart';
 import 'package:daily/models.dart';
 import 'package:daily/services/notification_service.dart';
 import 'package:daily/widgets/completion_progress_ring.dart';
+import 'package:daily/widgets/button_origin_route.dart';
+import 'package:daily/widgets/motion.dart' show MotionPageEntrance;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -619,6 +621,106 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'tabs cross-fade with gradual navigation color and smooth reversal',
+    (tester) async {
+      await setPhoneSize(tester);
+      await pumpDaily(
+        tester,
+        MemoryDailyStore(seedItems: [singleItem(dateOnly(DateTime.now()))]),
+      );
+      final pages = find.byType(MotionPageEntrance, skipOffstage: false);
+      double opacity(int index) => tester
+          .widget<FadeTransition>(
+            find
+                .descendant(
+                  of: pages.at(index),
+                  matching: find.byType(FadeTransition, skipOffstage: false),
+                  skipOffstage: false,
+                )
+                .first,
+          )
+          .opacity
+          .value;
+      final itemsTab = find.byKey(const Key('tab-items'));
+      Color? itemsColor() => tester
+          .widget<Icon>(
+            find.descendant(of: itemsTab, matching: find.byType(Icon)),
+          )
+          .color;
+      expect(opacity(0), 1);
+      expect(opacity(1), 0);
+      expect(itemsColor(), AppPalette.muted);
+      await tester.tap(itemsTab);
+      await tester.pump();
+      expect(opacity(0), 1);
+      expect(opacity(1), 0);
+      expect(itemsColor(), AppPalette.muted);
+      await tester.pump(const Duration(milliseconds: 80));
+      expect(opacity(0), allOf(greaterThan(0), lessThan(1)));
+      expect(opacity(1), allOf(greaterThan(0), lessThan(1)));
+      expect(itemsColor(), isNot(AppPalette.muted));
+      expect(itemsColor(), isNot(AppPalette.pine));
+      expect(find.byType(CalendarPage), findsOneWidget);
+      expect(find.byType(ItemsPage), findsOneWidget);
+      final calendarOpacity = opacity(0);
+      final itemsOpacity = opacity(1);
+      final navColor = itemsColor();
+      await tester.tap(find.byKey(const Key('tab-calendar')));
+      await tester.pump();
+      expect(opacity(0), calendarOpacity);
+      expect(opacity(1), itemsOpacity);
+      expect(itemsColor(), navColor);
+      await tester.pumpAndSettle();
+      expect(opacity(0), 1);
+      expect(opacity(1), 0);
+      expect(itemsColor(), AppPalette.muted);
+      expect(find.byType(ItemsPage), findsNothing);
+      expect(find.byType(ItemsPage, skipOffstage: false), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'reduced motion settles an active tab fade and switches immediately',
+    (tester) async {
+      addTearDown(
+        tester.binding.platformDispatcher.clearAccessibilityFeaturesTestValue,
+      );
+      await setPhoneSize(tester);
+      await pumpDaily(tester, MemoryDailyStore());
+      final pages = find.byType(MotionPageEntrance, skipOffstage: false);
+      double opacity(int index) => tester
+          .widget<FadeTransition>(
+            find
+                .descendant(
+                  of: pages.at(index),
+                  matching: find.byType(FadeTransition, skipOffstage: false),
+                  skipOffstage: false,
+                )
+                .first,
+          )
+          .opacity
+          .value;
+      await tester.tap(find.byKey(const Key('tab-items')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 80));
+      expect(opacity(1), allOf(greaterThan(0), lessThan(1)));
+      tester.binding.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(disableAnimations: true);
+      await tester.pump();
+      expect(opacity(0), 0);
+      expect(opacity(1), 1);
+      expect(find.byType(CalendarPage), findsNothing);
+      await tester.tap(find.byKey(const Key('tab-calendar')));
+      await tester.pump();
+      expect(opacity(0), 1);
+      expect(opacity(1), 0);
+      expect(find.byType(ItemsPage), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('tab switching preserves scroll expansion and item filter', (
     tester,
   ) async {
@@ -660,6 +762,147 @@ void main() {
     expect(tester.getTopLeft(indicator).dx, closeTo(selectedX, 0.1));
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('new item and settings expand from their actual launch buttons', (
+    tester,
+  ) async {
+    await setPhoneSize(tester);
+    await pumpDaily(tester, MemoryDailyStore());
+    final clip = find.byKey(const Key('button-origin-page-clip'));
+    Rect revealedBounds() {
+      final widget = tester.widget<ClipPath>(clip);
+      return widget.clipper!.getClip(tester.getSize(clip)).getBounds();
+    }
+
+    for (final (tab, key, page) in [
+      (0, 'add-item-button', ItemEditorPage),
+      (0, 'calendar-settings-button', SettingsPage),
+      (1, 'items-add-item-button', ItemEditorPage),
+      (1, 'items-settings-button', SettingsPage),
+    ]) {
+      await tester.tap(
+        find.byKey(Key(tab == 0 ? 'tab-calendar' : 'tab-items')),
+      );
+      await tester.pumpAndSettle();
+      final button = find.byKey(Key(key));
+      final origin = tester.getRect(button);
+      await tester.tap(button);
+      await tester.pump();
+      await tester.pump();
+      expect(clip, findsOneWidget);
+      final source = revealedBounds();
+      expect(source.left, closeTo(origin.left, .1));
+      expect(source.top, closeTo(origin.top, .1));
+      expect(source.size, origin.size);
+      await tester.pump(const Duration(milliseconds: 120));
+      final expanding = revealedBounds();
+      expect(expanding.width, greaterThan(origin.width));
+      expect(expanding.height, greaterThan(origin.height));
+      expect(expanding.contains(origin.center), isTrue);
+      final stationaryButton = find.byKey(Key(key), skipOffstage: false);
+      expect(
+        tester.getCenter(stationaryButton).dx,
+        closeTo(origin.center.dx, .1),
+      );
+      expect(
+        tester.getCenter(stationaryButton).dy,
+        closeTo(origin.center.dy, .1),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(page), findsOneWidget);
+      final full = revealedBounds();
+      expect(full, Offset.zero & tester.getSize(clip));
+      await tester.tap(find.byTooltip('返回'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+      final contracting = revealedBounds();
+      expect(contracting.width, lessThan(full.width));
+      expect(contracting.height, lessThan(full.height));
+      expect(contracting.contains(origin.center), isTrue);
+      await tester.pumpAndSettle();
+      expect(clip, findsNothing);
+      expect(find.byType(page), findsNothing);
+    }
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('return during expansion contracts from the current shape', (
+    tester,
+  ) async {
+    await setPhoneSize(tester);
+    await pumpDaily(tester, MemoryDailyStore());
+    await tester.tap(find.byKey(const Key('add-item-button')));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 280));
+    final clip = find.byKey(const Key('button-origin-page-clip'));
+    Rect bounds() => tester
+        .widget<ClipPath>(clip)
+        .clipper!
+        .getClip(tester.getSize(clip))
+        .getBounds();
+    final before = bounds();
+    expect(before.height, lessThan(tester.getSize(clip).height));
+    await tester.tap(find.byTooltip('返回'));
+    await tester.pump();
+    expect(bounds(), before);
+    await tester.pumpAndSettle();
+    expect(find.byType(ItemEditorPage), findsNothing);
+    expect(find.byType(CalendarPage), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('reduced motion opens the button-origin pages immediately', (
+    tester,
+  ) async {
+    tester.binding.platformDispatcher.accessibilityFeaturesTestValue =
+        const FakeAccessibilityFeatures(disableAnimations: true);
+    addTearDown(
+      tester.binding.platformDispatcher.clearAccessibilityFeaturesTestValue,
+    );
+    await setPhoneSize(tester);
+    await pumpDaily(tester, MemoryDailyStore());
+    for (final (key, page) in [
+      ('calendar-settings-button', SettingsPage),
+      ('add-item-button', ItemEditorPage),
+    ]) {
+      await tester.tap(find.byKey(Key(key)));
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(page), findsOneWidget);
+      expect(find.byType(ButtonExpansionTransition), findsNothing);
+      await tester.tap(find.byTooltip('返回'));
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(page), findsNothing);
+    }
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'canceling an edge swipe restores the expanded page and its draft',
+    (tester) async {
+      await setPhoneSize(tester);
+      await pumpDaily(tester, MemoryDailyStore());
+      await tester.tap(find.byKey(const Key('add-item-button')));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('item-title-field')),
+        '未保存草稿',
+      );
+      tester.testTextInput.hide();
+      await tester.pumpAndSettle();
+      final gesture = await tester.startGesture(const Offset(5, 400));
+      await gesture.moveBy(const Offset(60, 0));
+      await tester.pump(const Duration(milliseconds: 400));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(find.byType(ItemEditorPage), findsOneWidget);
+      expect(find.text('未保存草稿'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
 
   testWidgets('iOS editor supports the native edge swipe back gesture', (
     tester,
@@ -1099,6 +1342,8 @@ void main() {
       expect(find.text('日期范围'), findsOneWidget);
       expect(find.byKey(const Key('stock-quantity-field')), findsNothing);
       expect(find.byKey(const Key('editor-more-settings')), findsOneWidget);
+      expect(find.text('事项名称'), findsNothing);
+      expect(find.text('库存、保质期与提醒规则'), findsNothing);
       await tester.tap(find.byKey(const ValueKey<String>('icon-vitamin')));
       await tester.enterText(find.byKey(const Key('item-title-field')), '营养补充');
       await tester.tap(find.byKey(const Key('save-item-button')));
@@ -1138,6 +1383,8 @@ void main() {
       await tester.enterText(find.byKey(const Key('item-title-field')), '药片');
       await tester.tap(find.byKey(const Key('editor-more-settings')));
       await tester.pumpAndSettle();
+      expect(find.text('库存与用量'), findsNothing);
+      expect(find.text('按实际完成次数扣减，录入数量留空则不统计'), findsNothing);
       await tester.enterText(
         find.byKey(const Key('stock-quantity-field')),
         '5',

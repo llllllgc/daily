@@ -233,10 +233,16 @@ class MotionSwitcher extends StatelessWidget {
 }
 
 class MotionReveal extends StatefulWidget {
-  const MotionReveal({required this.visible, required this.child, super.key});
+  const MotionReveal({
+    required this.visible,
+    required this.child,
+    this.offset = Offset.zero,
+    super.key,
+  });
 
   final bool visible;
   final Widget child;
+  final Offset offset;
 
   @override
   State<MotionReveal> createState() => _MotionRevealState();
@@ -298,7 +304,16 @@ class _MotionRevealState extends State<MotionReveal>
           child: SizeTransition(
             alignment: Alignment.topLeft,
             sizeFactor: _curve,
-            child: FadeTransition(opacity: _curve, child: widget.child),
+            child: FadeTransition(
+              opacity: _curve,
+              child: SlideTransition(
+                position: Tween<Offset>(
+                  begin: widget.offset,
+                  end: Offset.zero,
+                ).animate(_curve),
+                child: widget.child,
+              ),
+            ),
           ),
         ),
       ),
@@ -306,7 +321,7 @@ class _MotionRevealState extends State<MotionReveal>
   }
 }
 
-/// Keeps each tab mounted, including its scroll and expansion state.
+/// Cross-fades mounted tabs, preserving scroll and expansion state.
 class MotionPageEntrance extends StatefulWidget {
   const MotionPageEntrance({
     required this.active,
@@ -323,35 +338,64 @@ class MotionPageEntrance extends StatefulWidget {
 
 class _MotionPageEntranceState extends State<MotionPageEntrance>
     with SingleTickerProviderStateMixin {
-  late final _controller = AnimationController(vsync: this, value: 1);
+  late final _controller = AnimationController(
+    vsync: this,
+    value: widget.active ? 1 : 0,
+  );
+  late final _opacity = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeInOutCubic,
+  );
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _controller.duration = appMotion(context, 160);
-    if (MediaQuery.disableAnimationsOf(context)) _controller.value = 1;
+    _controller.duration = appMotion(context, 320);
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller.value = widget.active ? 1 : 0;
+    }
   }
 
   @override
   void didUpdateWidget(MotionPageEntrance oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.active && !oldWidget.active) {
-      _controller.forward(from: 0);
-    } else if (!widget.active) {
-      _controller.value = 1;
+    if (widget.active == oldWidget.active) return;
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller.value = widget.active ? 1 : 0;
+    } else if (widget.active) {
+      _controller.forward();
+    } else {
+      _controller.reverse();
     }
   }
 
   @override
   void dispose() {
+    _opacity.dispose();
     _controller.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => TickerMode(
-    enabled: widget.active,
-    child: FadeTransition(opacity: _controller, child: widget.child),
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: _controller,
+    child: FadeTransition(opacity: _opacity, child: widget.child),
+    builder: (context, child) => Offstage(
+      offstage: !widget.active && _controller.isDismissed,
+      child: IgnorePointer(
+        ignoring: !widget.active,
+        child: ExcludeFocus(
+          excluding: !widget.active,
+          child: ExcludeSemantics(
+            excluding: !widget.active,
+            child: TickerMode(
+              enabled: widget.active || _controller.isAnimating,
+              child: child!,
+            ),
+          ),
+        ),
+      ),
+    ),
   );
 }
 

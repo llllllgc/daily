@@ -19,6 +19,7 @@ import 'theme.dart';
 import 'item_icons.dart';
 import 'widgets/item_icon.dart';
 import 'widgets/completion_progress_ring.dart';
+import 'widgets/button_origin_route.dart';
 import 'widgets/motion.dart';
 
 export 'widgets/motion.dart' show appMotion;
@@ -331,6 +332,7 @@ class DailyShell extends StatefulWidget {
 }
 
 class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
+  late final _buttonOrigin = ButtonOriginController();
   int _selectedIndex = 0;
   int _revision = 0;
   StreamSubscription<void>? _refreshSubscription;
@@ -373,10 +375,17 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
 
   Future<void> _openEditor([ReminderItem? item]) async {
     ScaffoldMessenger.of(context).clearSnackBars();
+    final origin = _buttonOrigin.take();
+    Widget editor(BuildContext context) =>
+        ItemEditorPage(store: widget.store, item: item);
     final saved = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(
-        builder: (_) => ItemEditorPage(store: widget.store, item: item),
-      ),
+      item == null && origin != null
+          ? ButtonOriginPageRoute<bool>(
+              origin: origin,
+              reduceMotion: MediaQuery.disableAnimationsOf(context),
+              builder: editor,
+            )
+          : MaterialPageRoute<bool>(builder: editor),
     );
     if (saved ?? false) {
       _refresh();
@@ -387,14 +396,20 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
 
   Future<void> _openSettings() async {
     ScaffoldMessenger.of(context).clearSnackBars();
+    final origin = _buttonOrigin.take();
+    Widget settings(BuildContext context) => SettingsPage(
+      store: widget.store,
+      scheduler: widget.scheduler,
+      revision: _revision,
+    );
     await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
-        builder: (_) => SettingsPage(
-          store: widget.store,
-          scheduler: widget.scheduler,
-          revision: _revision,
-        ),
-      ),
+      origin != null
+          ? ButtonOriginPageRoute<void>(
+              origin: origin,
+              reduceMotion: MediaQuery.disableAnimationsOf(context),
+              builder: settings,
+            )
+          : MaterialPageRoute<void>(builder: settings),
     );
     _refresh();
   }
@@ -521,24 +536,27 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
         onEditTime: _editReminderTime,
       ),
     ];
-    return Scaffold(
-      body: IndexedStack(
-        index: _selectedIndex,
-        children: [
-          for (var index = 0; index < pages.length; index++)
-            MotionPageEntrance(
-              active: index == _selectedIndex,
-              child: pages[index],
-            ),
-        ],
-      ),
-      bottomNavigationBar: AppBottomNavigation(
-        selectedIndex: _selectedIndex,
-        onSelected: (index) {
-          if (_selectedIndex == index) return;
-          ScaffoldMessenger.of(context).clearSnackBars();
-          setState(() => _selectedIndex = index);
-        },
+    return ButtonOriginScope(
+      controller: _buttonOrigin,
+      child: Scaffold(
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            for (var index = 0; index < pages.length; index++)
+              MotionPageEntrance(
+                active: index == _selectedIndex,
+                child: pages[index],
+              ),
+          ],
+        ),
+        bottomNavigationBar: AppBottomNavigation(
+          selectedIndex: _selectedIndex,
+          onSelected: (index) {
+            if (_selectedIndex == index) return;
+            ScaffoldMessenger.of(context).clearSnackBars();
+            setState(() => _selectedIndex = index);
+          },
+        ),
       ),
     );
   }
@@ -1169,6 +1187,7 @@ class CalendarHeader extends StatelessWidget {
             ),
             SoftIconButton(
               key: const Key('add-item-button'),
+              captureOrigin: true,
               icon: Icons.add_rounded,
               tooltip: '新建事项',
               onPressed: onAdd,
@@ -1176,6 +1195,7 @@ class CalendarHeader extends StatelessWidget {
             const SizedBox(width: 8),
             SoftIconButton(
               key: const Key('calendar-settings-button'),
+              captureOrigin: true,
               icon: Icons.settings_rounded,
               tooltip: '设置',
               onPressed: onOpenSettings,
@@ -1518,7 +1538,7 @@ class TaskGroupView extends StatelessWidget {
               child: ConstrainedBox(
                 constraints: const BoxConstraints(minHeight: 66),
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 14, 10, 4),
+                  padding: const EdgeInsets.fromLTRB(16, 9, 10, 9),
                   child: Row(
                     children: [
                       DailyItemIcon(
@@ -2138,10 +2158,15 @@ class EmptyDayState extends StatelessWidget {
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 14),
-          TextButton.icon(
-            onPressed: onAdd,
-            icon: const Icon(Icons.add_rounded),
-            label: const Text('新建事项'),
+          Builder(
+            builder: (buttonContext) => TextButton.icon(
+              onPressed: () {
+                ButtonOriginScope.capture(buttonContext);
+                onAdd();
+              },
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('新建事项'),
+            ),
           ),
         ],
       ),
@@ -2217,6 +2242,7 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
   late bool _alertMonthBefore;
   late bool _alertWeekBefore;
   bool _saving = false;
+  bool _iconChoicesExpanded = false;
 
   String get _frequencyLabel => switch (_repeatKind) {
     RepeatKind.daily => '每天 · ${_times.length} 次',
@@ -2512,17 +2538,6 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
       ? _times.first.label
       : '${_times.first.label} 等 ${_times.length} 个时间';
 
-  String get _settingsSummary {
-    final settings = <String>[
-      if (_stockController.text.trim().isNotEmpty) '已设置库存',
-      if (_productionDate != null || _expiryDate != null) '已设置保质期',
-      if (_snoozeEnabled) '稍后 $_snoozeMinutes 分钟提醒',
-      if (_endDate != null && (_alertMonthBefore || _alertWeekBefore))
-        '周期结束前提醒',
-    ];
-    return settings.isEmpty ? '库存、保质期与提醒规则' : settings.join(' · ');
-  }
-
   static String? _validateStock(String? value) {
     if (value == null || value.trim().isEmpty) return null;
     final amount = double.tryParse(value.trim());
@@ -2797,13 +2812,6 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const _EditorSectionLabel('库存与用量'),
-            const SizedBox(height: 6),
-            Text(
-              '按实际完成次数扣减，录入数量留空则不统计',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: 14),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -3020,27 +3028,11 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     HapticFeedback.selectionClick();
   }
 
-  Future<void> _showIconSettings() => _showEditorSheet(
-    title: '图标与分类',
-    content: (context, refresh) {
-      final category = ItemIcons.categoryFor(_iconKey);
-      void choose(String key) {
-        _selectIcon(key);
-        refresh(() {});
-      }
-
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _ItemCategoryPicker(iconKey: _iconKey, onSelected: choose),
-          const SizedBox(height: 22),
-          _EditorSectionLabel('${category.label}图标'),
-          const SizedBox(height: 10),
-          _ItemIconChoices(iconKey: _iconKey, onSelected: choose),
-        ],
-      );
-    },
-  );
+  void _toggleIconChoices() {
+    FocusScope.of(context).unfocus();
+    HapticFeedback.selectionClick();
+    setState(() => _iconChoicesExpanded = !_iconChoicesExpanded);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3103,42 +3095,38 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                           ),
                           const SizedBox(width: 14),
                           Expanded(
-                            child: TextFormField(
-                              key: const Key('item-title-field'),
-                              controller: _titleController,
-                              textInputAction: TextInputAction.done,
-                              maxLength: 30,
-                              style: const TextStyle(
-                                fontSize: 23,
-                                fontWeight: FontWeight.w500,
-                              ),
-                              decoration: InputDecoration(
-                                labelText: '事项名称',
-                                floatingLabelBehavior:
-                                    FloatingLabelBehavior.always,
-                                labelStyle: TextStyle(
-                                  fontSize: 12,
-                                  color: context.palette.muted,
+                            child: Semantics(
+                              label: '事项名称',
+                              child: TextFormField(
+                                key: const Key('item-title-field'),
+                                controller: _titleController,
+                                textInputAction: TextInputAction.done,
+                                maxLength: 30,
+                                style: const TextStyle(
+                                  fontSize: 23,
+                                  fontWeight: FontWeight.w500,
                                 ),
-                                hintText: '例如：维生素 D',
-                                hintStyle: TextStyle(
-                                  fontSize: 19,
-                                  color: context.palette.mutedLight,
-                                  fontWeight: FontWeight.w400,
+                                decoration: InputDecoration(
+                                  hintText: '例如：维生素 D',
+                                  hintStyle: TextStyle(
+                                    fontSize: 19,
+                                    color: context.palette.mutedLight,
+                                    fontWeight: FontWeight.w400,
+                                  ),
+                                  filled: false,
+                                  counterText: '',
+                                  contentPadding: EdgeInsets.zero,
+                                  border: InputBorder.none,
+                                  enabledBorder: InputBorder.none,
+                                  focusedBorder: InputBorder.none,
+                                  errorBorder: InputBorder.none,
+                                  focusedErrorBorder: InputBorder.none,
                                 ),
-                                filled: false,
-                                counterText: '',
-                                contentPadding: EdgeInsets.zero,
-                                border: InputBorder.none,
-                                enabledBorder: InputBorder.none,
-                                focusedBorder: InputBorder.none,
-                                errorBorder: InputBorder.none,
-                                focusedErrorBorder: InputBorder.none,
+                                validator: (value) =>
+                                    value == null || value.trim().isEmpty
+                                    ? '请填写事项名称'
+                                    : null,
                               ),
-                              validator: (value) =>
-                                  value == null || value.trim().isEmpty
-                                  ? '请填写事项名称'
-                                  : null,
                             ),
                           ),
                         ],
@@ -3149,18 +3137,75 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         const _EditorSectionLabel('分类'),
-                        TextButton(
-                          key: const Key('editor-icon-settings'),
-                          onPressed: _showIconSettings,
-                          child: Text(
-                            '${ItemIcons.choiceFor(_iconKey).label} · 更换图标',
+                        Semantics(
+                          container: true,
+                          label: _iconChoicesExpanded ? '收起图标' : '更多图标',
+                          expanded: _iconChoicesExpanded,
+                          child: Tooltip(
+                            message: _iconChoicesExpanded ? '收起图标' : '更多图标',
+                            excludeFromSemantics: true,
+                            child: SizedBox(
+                              width: 64,
+                              height: 32,
+                              child: TextButton(
+                                key: const Key('editor-icon-settings'),
+                                onPressed: _toggleIconChoices,
+                                style: TextButton.styleFrom(
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: const Size(64, 32),
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                  backgroundColor: _iconChoicesExpanded
+                                      ? context.palette.parentNote
+                                      : context.palette.canvasRaised,
+                                  foregroundColor: context.palette.pine,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                child: AnimatedRotation(
+                                  key: const Key('editor-icon-toggle-symbol'),
+                                  turns: _iconChoicesExpanded ? .125 : 0,
+                                  duration: appMotion(context, 220),
+                                  curve: Curves.easeInOutCubic,
+                                  child: const Icon(
+                                    Icons.add_rounded,
+                                    size: 23,
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                       ],
                     ),
+                    const SizedBox(height: 10),
                     _ItemCategoryPicker(
                       iconKey: _iconKey,
                       onSelected: _selectIcon,
+                    ),
+                    MotionReveal(
+                      key: const Key('editor-extra-icons'),
+                      visible: _iconChoicesExpanded,
+                      offset: const Offset(0, -.12),
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Column(
+                          children: [
+                            Divider(
+                              key: const Key('editor-extra-icons-divider'),
+                              height: 1,
+                              thickness: 1,
+                              color: context.palette.rule,
+                            ),
+                            const SizedBox(height: 12),
+                            _ItemIconChoices(
+                              iconKey: _iconKey,
+                              onSelected: _selectIcon,
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
                     const SizedBox(height: 20),
                     const _EditorSectionLabel('安排'),
@@ -3212,23 +3257,10 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                                 color: context.palette.muted,
                               ),
                               const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      '更多设置',
-                                      style: TextStyle(fontSize: 14),
-                                    ),
-                                    const SizedBox(height: 3),
-                                    Text(
-                                      _settingsSummary,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: context.palette.muted,
-                                      ),
-                                    ),
-                                  ],
+                              const Expanded(
+                                child: Text(
+                                  '更多设置',
+                                  style: TextStyle(fontSize: 14),
                                 ),
                               ),
                               const SizedBox(width: 8),
@@ -3919,6 +3951,8 @@ class _ItemsPageState extends State<ItemsPage> {
                   ),
                 ),
                 SoftIconButton(
+                  key: const Key('items-add-item-button'),
+                  captureOrigin: true,
                   icon: Icons.add_rounded,
                   tooltip: '新建事项',
                   onPressed: widget.onAdd,
@@ -3926,6 +3960,7 @@ class _ItemsPageState extends State<ItemsPage> {
                 const SizedBox(width: 8),
                 SoftIconButton(
                   key: const Key('items-settings-button'),
+                  captureOrigin: true,
                   icon: Icons.settings_rounded,
                   tooltip: '设置',
                   onPressed: widget.onOpenSettings,
@@ -4082,7 +4117,7 @@ class _ManagementItemCard extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 6, 4),
           child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               DailyItemIcon(
                 item.iconKey,
@@ -4210,10 +4245,15 @@ class _ItemsEmptyState extends StatelessWidget {
           ),
           if (canAdd) ...[
             const SizedBox(height: 14),
-            TextButton.icon(
-              onPressed: onAdd,
-              icon: const Icon(Icons.add_rounded),
-              label: const Text('新建事项'),
+            Builder(
+              builder: (buttonContext) => TextButton.icon(
+                onPressed: () {
+                  ButtonOriginScope.capture(buttonContext);
+                  onAdd();
+                },
+                icon: const Icon(Icons.add_rounded),
+                label: const Text('新建事项'),
+              ),
             ),
           ],
         ],
@@ -4894,6 +4934,7 @@ class SoftIconButton extends StatelessWidget {
     required this.tooltip,
     required this.onPressed,
     this.transparent = false,
+    this.captureOrigin = false,
     super.key,
   });
 
@@ -4901,6 +4942,7 @@ class SoftIconButton extends StatelessWidget {
   final String tooltip;
   final VoidCallback onPressed;
   final bool transparent;
+  final bool captureOrigin;
 
   @override
   Widget build(BuildContext context) {
@@ -4911,7 +4953,10 @@ class SoftIconButton extends StatelessWidget {
       shadowColor: context.palette.pine.withValues(alpha: 0.14),
       child: IconButton(
         tooltip: tooltip,
-        onPressed: onPressed,
+        onPressed: () {
+          if (captureOrigin) ButtonOriginScope.capture(context);
+          onPressed();
+        },
         icon: Icon(icon, color: context.palette.ink, size: 24),
       ),
     );
@@ -4997,8 +5042,9 @@ class _BottomNavigationItem extends StatelessWidget {
             },
             child: Center(
               child: AnimatedContainer(
-                duration: appMotion(context, 180),
-                curve: Curves.easeOutCubic,
+                key: ValueKey(MediaQuery.disableAnimationsOf(context)),
+                duration: appMotion(context, 320),
+                curve: Curves.easeInOutCubic,
                 width: 54,
                 height: 38,
                 decoration: BoxDecoration(
@@ -5007,10 +5053,15 @@ class _BottomNavigationItem extends StatelessWidget {
                       : Colors.transparent,
                   borderRadius: BorderRadius.circular(AppRadii.pill),
                 ),
-                child: Icon(
-                  selected ? selectedIcon : icon,
-                  color: color,
-                  size: 24,
+                child: TweenAnimationBuilder<Color?>(
+                  tween: ColorTween(begin: color, end: color),
+                  duration: appMotion(context, 320),
+                  curve: Curves.easeInOutCubic,
+                  builder: (context, color, _) => Icon(
+                    selected ? selectedIcon : icon,
+                    color: color,
+                    size: 24,
+                  ),
                 ),
               ),
             ),

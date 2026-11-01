@@ -43,6 +43,133 @@ class _FailingThemeStore extends MemoryDailyStore {
 
 void main() {
   testWidgets(
+    'more icons rotate and slide inline, retaining the choice when closed',
+    (tester) async {
+      await _pump(tester, MemoryDailyStore());
+      await tester.tap(find.byKey(const Key('add-item-button')));
+      await tester.pumpAndSettle();
+      final button = find.byKey(const Key('editor-icon-settings'));
+      final panel = find.byKey(const Key('editor-extra-icons'));
+      final settings = find.byKey(const Key('editor-repeat-settings'));
+      final rotation = find.descendant(
+        of: find.byKey(const Key('editor-icon-toggle-symbol')),
+        matching: find.byType(RotationTransition),
+      );
+      double turns() => tester.widget<RotationTransition>(rotation).turns.value;
+      final initialSettingsY = tester.getTopLeft(settings).dy;
+      expect(tester.getSize(button), const Size(64, 32));
+      final firstIcon = find.byKey(const ValueKey('icon-medication'));
+      expect(
+        tester.getBottomLeft(button).dy,
+        lessThan(tester.getTopLeft(firstIcon).dy),
+      );
+      expect(tester.getSize(panel).height, 0);
+      expect(turns(), 0);
+      expect(find.bySemanticsLabel('更多图标'), findsOneWidget);
+
+      await tester.tap(button);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 60));
+      final openingHeight = tester.getSize(panel).height;
+      expect(openingHeight, greaterThan(0));
+      expect(turns(), allOf(greaterThan(0), lessThan(.125)));
+      final slide = find.descendant(
+        of: panel,
+        matching: find.byType(SlideTransition),
+      );
+      expect(
+        tester.widget<SlideTransition>(slide).position.value.dy,
+        lessThan(0),
+      );
+      await tester.pumpAndSettle();
+      final fullHeight = tester.getSize(panel).height;
+      expect(fullHeight, greaterThan(openingHeight));
+      expect(turns(), .125);
+      expect(find.bySemanticsLabel('收起图标'), findsOneWidget);
+      expect(
+        tester.getTopLeft(settings).dy,
+        closeTo(initialSettingsY + fullHeight, .1),
+      );
+      expect(find.byType(BottomSheet), findsNothing);
+      final divider = find.byKey(const Key('editor-extra-icons-divider'));
+      expect(divider, findsOneWidget);
+      expect(
+        tester.getTopLeft(divider).dy,
+        greaterThan(tester.getBottomLeft(firstIcon).dy),
+      );
+      expect(
+        tester.getBottomLeft(divider).dy,
+        lessThan(
+          tester
+              .getTopLeft(find.byKey(const ValueKey('item-icon-medication')))
+              .dy,
+        ),
+      );
+
+      await tester.tap(find.byKey(const ValueKey('item-icon-pill-bottle')));
+      await tester.pumpAndSettle();
+      await tester.tap(button);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 60));
+      final closingHeight = tester.getSize(panel).height;
+      expect(closingHeight, allOf(greaterThan(0), lessThan(fullHeight)));
+      expect(turns(), allOf(greaterThan(0), lessThan(.125)));
+      expect(
+        tester.widget<SlideTransition>(slide).position.value.dy,
+        lessThan(0),
+      );
+      // Reversing an in-flight collapse must continue from the visible position.
+      await tester.tap(button);
+      await tester.pump();
+      expect(tester.getSize(panel).height, closeTo(closingHeight, .1));
+      await tester.pumpAndSettle();
+      expect(tester.getSize(panel).height, fullHeight);
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      expect(tester.getSize(panel).height, 0);
+      expect(turns(), 0);
+      expect(find.byKey(const ValueKey('item-icon-pill-bottle')), findsNothing);
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is DailyItemIcon && widget.iconKey == 'pill-bottle',
+        ),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('inline icons open and close immediately with reduced motion', (
+    tester,
+  ) async {
+    tester.binding.platformDispatcher.accessibilityFeaturesTestValue =
+        const FakeAccessibilityFeatures(disableAnimations: true);
+    addTearDown(
+      tester.binding.platformDispatcher.clearAccessibilityFeaturesTestValue,
+    );
+    await _pump(tester, MemoryDailyStore());
+    await tester.tap(find.byKey(const Key('add-item-button')));
+    await tester.pumpAndSettle();
+    final button = find.byKey(const Key('editor-icon-settings'));
+    final panel = find.byKey(const Key('editor-extra-icons'));
+    final rotation = find.descendant(
+      of: find.byKey(const Key('editor-icon-toggle-symbol')),
+      matching: find.byType(RotationTransition),
+    );
+    await tester.tap(button);
+    await tester.pump();
+    expect(tester.getSize(panel).height, 81);
+    expect(tester.widget<RotationTransition>(rotation).turns.value, .125);
+    await tester.tap(button);
+    await tester.pump();
+    expect(tester.getSize(panel).height, 0);
+    expect(tester.widget<RotationTransition>(rotation).turns.value, 0);
+    expect(find.byKey(const ValueKey('item-icon-pill-bottle')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
     'theme changes every screen and is restored after restarting the app',
     (tester) async {
       final store = MemoryDailyStore(seedItems: [_item()]);
@@ -113,12 +240,11 @@ void main() {
       await tester.enterText(find.byKey(const Key('item-title-field')), '阅读笔记');
       await tester.tap(find.byKey(const Key('editor-icon-settings')));
       await tester.pumpAndSettle();
-      // The editor remains behind the sheet; target the visible sheet controls.
-      await tester.tap(find.byKey(const ValueKey('icon-study')).last);
+      await tester.tap(find.byKey(const ValueKey('icon-study')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('item-icon-notebook-pen')));
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('editor-sheet-done')));
+      await tester.tap(find.byKey(const Key('editor-icon-settings')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('save-item-button')));
       await tester.pumpAndSettle();
@@ -140,7 +266,24 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.text('记录 · 更换图标'), findsOneWidget);
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is DailyItemIcon && widget.iconKey == 'notebook-pen',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const Key('editor-icon-settings')));
+      await tester.pumpAndSettle();
+      final selected = tester.widget<Semantics>(
+        find
+            .descendant(
+              of: find.byKey(const ValueKey('item-icon-notebook-pen')),
+              matching: find.byType(Semantics),
+            )
+            .first,
+      );
+      expect(selected.properties.selected, isTrue);
       expect(tester.takeException(), isNull);
     },
   );
