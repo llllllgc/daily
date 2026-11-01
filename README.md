@@ -39,7 +39,7 @@ Daily 适合记录容易忘记但需要持续完成的小事，例如服药、�
 ### 环境要求
 
 - Flutter stable（当前已验证 Flutter 3.47.8 / Dart 3.13.7）
-- Android 开发需要 Android SDK
+- Android 开发需要 JDK 17 和 Android SDK
 - iOS 开发需要 macOS、Xcode 和已安装的 iOS 模拟器运行时；工程最低支持 iOS 15.0
 
 ### 运行
@@ -109,6 +109,13 @@ flutter build apk --release
 ```
 
 构建产物位于 `build/app/outputs/flutter-apk/`。
+
+Android 与 iOS 使用同一套 `lib/` 功能代码；主题、日历、库存和提醒交互的更新会同时用于两个平台。
+
+推送到 `main` 或提交 Pull Request 后，GitHub Actions 会自动执行静态检查、全部测试和 Android release APK 构建。
+也可以在 [Flutter checks](https://github.com/llllllgc/daily/actions/workflows/flutter.yml) 页面手动运行。
+打开成功的运行记录，在 Artifacts 中下载 `daily-android-<提交 SHA>`，解压后即可获得 `app-release.apk`；产物保留 30 天。
+当前 release 构建沿用工程的调试签名，适合安装验证；正式分发前需要配置自己的发布签名。
 
 ## 项目结构
 
