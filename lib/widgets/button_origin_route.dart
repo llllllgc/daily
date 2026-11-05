@@ -131,7 +131,7 @@ class ButtonExpansionTransition extends StatelessWidget {
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) => AnimatedBuilder(
       animation: animation,
-      child: child,
+      child: RepaintBoundary(child: child),
       builder: (context, child) {
         final size = constraints.biggest;
         final source = origin.boundsFor(size);

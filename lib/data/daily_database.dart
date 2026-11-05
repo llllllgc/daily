@@ -1,9 +1,13 @@
+import 'dart:convert';
+
 import 'package:path/path.dart' as path;
 import 'package:sqflite/sqflite.dart';
 
 import '../models.dart';
 
-class SqliteDailyStore implements DailyStore {
+class SqliteDailyStore extends DailyStore {
+  SqliteDailyStore({this.databasePath});
+  final String? databasePath;
   Database? _database;
 
   Future<Database> get database async {
@@ -17,10 +21,11 @@ class SqliteDailyStore implements DailyStore {
     if (_database != null) return;
     final root = await getDatabasesPath();
     _database = await openDatabase(
-      path.join(root, 'daily.sqlite3'),
-      version: 3,
+      databasePath ?? path.join(root, 'daily.sqlite3'),
+      version: 4,
       onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
       onCreate: (db, version) async {
+        await _createJournal(db);
         await db.execute(
           'CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
         );
@@ -28,6 +33,7 @@ class SqliteDailyStore implements DailyStore {
           CREATE TABLE items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
             icon_key TEXT NOT NULL,
             start_date TEXT NOT NULL,
             end_date TEXT,
@@ -53,6 +59,7 @@ class SqliteDailyStore implements DailyStore {
             item_id INTEGER NOT NULL,
             minute_of_day INTEGER NOT NULL,
             sort_order INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
           )
         ''');
@@ -77,6 +84,15 @@ class SqliteDailyStore implements DailyStore {
         );
       },
       onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 4) {
+          await db.execute(
+            "ALTER TABLE items ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+          );
+          await db.execute(
+            'ALTER TABLE reminder_times ADD COLUMN active INTEGER NOT NULL DEFAULT 1',
+          );
+          await _createJournal(db);
+        }
         if (oldVersion < 3) {
           await db.execute(
             'CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
@@ -140,7 +156,7 @@ class SqliteDailyStore implements DailyStore {
     final placeholders = List.filled(ids.length, '?').join(',');
     final timeRows = await db.query(
       'reminder_times',
-      where: 'item_id IN ($placeholders)',
+      where: 'item_id IN ($placeholders) AND active = 1',
       whereArgs: ids,
       orderBy: 'sort_order ASC, minute_of_day ASC, id ASC',
     );
@@ -173,7 +189,7 @@ class SqliteDailyStore implements DailyStore {
     final itemRows = await txn.query('items', where: 'id = ?', whereArgs: [id]);
     final timeRows = await txn.query(
       'reminder_times',
-      where: 'item_id = ?',
+      where: 'item_id = ? AND active = 1',
       whereArgs: [id],
       orderBy: 'sort_order ASC, minute_of_day ASC, id ASC',
     );
@@ -193,6 +209,7 @@ class SqliteDailyStore implements DailyStore {
   Future<ReminderItem> saveItem(ReminderItem item) async {
     final db = await database;
     return db.transaction((txn) async {
+      final old = item.id == null ? null : await _loadItem(item.id!, txn);
       final values = _itemValues(item);
 
       late final int itemId;
@@ -200,18 +217,6 @@ class SqliteDailyStore implements DailyStore {
         itemId = await txn.insert('items', values);
       } else {
         itemId = item.id!;
-        final retainedTimeIds = item.times
-            .map((time) => time.id)
-            .whereType<int>()
-            .toList();
-        final placeholders = List.filled(retainedTimeIds.length, '?').join(',');
-        final removedUsage = await txn.rawQuery(
-          'SELECT SUM(quantity_used) AS used FROM completions WHERE item_id = ? ${retainedTimeIds.isEmpty ? '' : 'AND reminder_time_id NOT IN ($placeholders)'}',
-          [itemId, ...retainedTimeIds],
-        );
-        values['used_quantity_base'] =
-            item.usedQuantityBase +
-            ((removedUsage.single['used'] as num?)?.toDouble() ?? 0);
         await txn.update('items', values, where: 'id = ?', whereArgs: [itemId]);
       }
 
@@ -222,6 +227,7 @@ class SqliteDailyStore implements DailyStore {
           'item_id': itemId,
           'minute_of_day': time.minuteOfDay,
           'sort_order': index,
+          'active': 1,
         };
         if (time.id == null || item.id == null) {
           final timeId = await txn.insert('reminder_times', timeValues);
@@ -237,22 +243,21 @@ class SqliteDailyStore implements DailyStore {
         }
       }
 
-      if (retainedIds.isEmpty) {
-        await txn.delete(
-          'reminder_times',
-          where: 'item_id = ?',
-          whereArgs: [itemId],
-        );
-      } else {
-        final placeholders = List.filled(retainedIds.length, '?').join(',');
-        await txn.delete(
-          'reminder_times',
-          where: 'item_id = ? AND id NOT IN ($placeholders)',
-          whereArgs: [itemId, ...retainedIds],
-        );
-      }
-
-      return _loadItem(itemId, txn);
+      final placeholders = List.filled(retainedIds.length, '?').join(',');
+      await txn.update(
+        'reminder_times',
+        {'active': 0},
+        where: 'item_id = ? AND id NOT IN ($placeholders)',
+        whereArgs: [itemId, ...retainedIds],
+      );
+      final saved = await _loadItem(itemId, txn);
+      final versions = await _readJournal(txn, 'versions');
+      await _writeJournal(
+        txn,
+        'versions',
+        planVersionChanges(versions, old, saved),
+      );
+      return saved;
     });
   }
 
@@ -336,32 +341,42 @@ class SqliteDailyStore implements DailyStore {
     required bool completed,
     DateTime? completedAt,
   }) async {
+    final occurrence = await history.occurrence(itemId, reminderTimeId, date);
     final db = await database;
     final where =
         'item_id = ? AND reminder_time_id = ? AND occurrence_date = ?';
     final args = <Object>[itemId, reminderTimeId, dayKey(date)];
-    if (!completed) {
-      await db.delete('completions', where: where, whereArgs: args);
-      return;
-    }
     await db.transaction((txn) async {
-      final itemRows = await txn.query(
-        'items',
-        columns: ['stock_quantity', 'dose_quantity'],
-        where: 'id = ?',
-        whereArgs: [itemId],
+      if (!completed) {
+        await txn.delete('completions', where: where, whereArgs: args);
+      } else {
+        await txn.insert('completions', <String, Object?>{
+          'item_id': itemId,
+          'reminder_time_id': reminderTimeId,
+          'occurrence_date': dayKey(date),
+          'completed_at': (completedAt ?? DateTime.now()).toIso8601String(),
+          'quantity_used': occurrence.item.stockQuantity == null
+              ? 0
+              : occurrence.item.doseQuantity,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      final existing = completed
+          ? await txn.query('completions', where: where, whereArgs: args)
+          : <Map<String, Object?>>[];
+      final next = occurrence.copyWith(
+        status: completed
+            ? OccurrenceStatus.completed
+            : dateOnly(date).isBefore(dateOnly(DateTime.now()))
+            ? OccurrenceStatus.missed
+            : OccurrenceStatus.pending,
+        changedAt: existing.isNotEmpty
+            ? DateTime.parse(existing.single['completed_at'] as String)
+            : completedAt ?? DateTime.now(),
+        quantityUsed: existing.isNotEmpty
+            ? (existing.single['quantity_used'] as num).toDouble()
+            : 0,
       );
-      if (itemRows.isEmpty) throw StateError('Reminder no longer exists.');
-      final item = itemRows.single;
-      await txn.insert('completions', <String, Object?>{
-        'item_id': itemId,
-        'reminder_time_id': reminderTimeId,
-        'occurrence_date': dayKey(date),
-        'completed_at': (completedAt ?? DateTime.now()).toIso8601String(),
-        'quantity_used': item['stock_quantity'] == null
-            ? 0
-            : (item['dose_quantity'] as num).toDouble(),
-      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      await _writeJournal(txn, 'records', {next.key: next.toJson()});
     });
   }
 
@@ -403,9 +418,203 @@ class SqliteDailyStore implements DailyStore {
     return Sqflite.firstIntValue(result) ?? 0;
   }
 
+  static Future<void> _createJournal(DatabaseExecutor db) => db.execute(
+    'CREATE TABLE journal (kind TEXT NOT NULL, entry_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind, entry_key))',
+  );
+
+  Future<Map<String, Map<String, Object?>>> _readJournal(
+    DatabaseExecutor db,
+    String kind, {
+    String? key,
+    DateTime? from,
+    DateTime? to,
+  }) async {
+    final where = [
+      'kind = ?',
+      if (key != null) 'entry_key = ?',
+      if (from != null) 'substr(entry_key, -10) >= ?',
+      if (to != null) 'substr(entry_key, -10) <= ?',
+    ].join(' AND ');
+    final args = <Object>[
+      kind,
+      ?key,
+      if (from != null) dayKey(from),
+      if (to != null) dayKey(to),
+    ];
+    return {
+      for (final row in await db.query(
+        'journal',
+        where: where,
+        whereArgs: args,
+      ))
+        row['entry_key'] as String: Map<String, Object?>.from(
+          jsonDecode(row['data'] as String) as Map,
+        ),
+    };
+  }
+
+  Future<void> _writeJournal(
+    DatabaseExecutor db,
+    String kind,
+    Map<String, Map<String, Object?>> entries, {
+    bool onlyIfAbsent = false,
+    bool onlyIfPending = false,
+  }) async {
+    for (final entry in entries.entries) {
+      if (onlyIfPending) {
+        final current = await db.query(
+          'journal',
+          where: 'kind = ? AND entry_key = ?',
+          whereArgs: [kind, entry.key],
+        );
+        if (current.isEmpty ||
+            (jsonDecode(current.single['data'] as String) as Map)['status'] !=
+                'pending') {
+          continue;
+        }
+      }
+      await db.insert(
+        'journal',
+        {'kind': kind, 'entry_key': entry.key, 'data': jsonEncode(entry.value)},
+        conflictAlgorithm: onlyIfAbsent
+            ? ConflictAlgorithm.ignore
+            : ConflictAlgorithm.replace,
+      );
+    }
+  }
+
+  @override
+  Future<Map<String, Map<String, Object?>>> loadJournal(
+    String kind, {
+    String? key,
+    DateTime? from,
+    DateTime? to,
+  }) async => _readJournal(await database, kind, key: key, from: from, to: to);
+  @override
+  Future<void> writeJournal(
+    String kind,
+    Map<String, Map<String, Object?>> entries, {
+    bool onlyIfAbsent = false,
+    bool onlyIfPending = false,
+  }) async {
+    final db = await database;
+    await db.transaction(
+      (txn) => _writeJournal(
+        txn,
+        kind,
+        entries,
+        onlyIfAbsent: onlyIfAbsent,
+        onlyIfPending: onlyIfPending,
+      ),
+    );
+  }
+
+  @override
+  Future<String> exportBackup() async {
+    await history.reconcile();
+    await history.loadDay(DateTime.now());
+    final db = await database;
+    final stored = await loadJournal('records');
+    final corrections = <String, Map<String, Object?>>{};
+    for (final row in await db.query('completions')) {
+      final date = parseDay(row['occurrence_date'] as String);
+      final id = row['item_id'] as int;
+      final timeId = row['reminder_time_id'] as int;
+      if (!stored.containsKey(completionKey(id, timeId, date))) {
+        await history.recordCompletion(
+          id,
+          timeId,
+          date,
+          true,
+          completedAt: DateTime.parse(row['completed_at'] as String),
+        );
+      }
+      final key = completionKey(id, timeId, date);
+      final raw = stored[key] ?? (await loadJournal('records'))[key];
+      if (raw != null && raw['quantity'] != row['quantity_used']) {
+        corrections[key] = {...raw, 'quantity': row['quantity_used']};
+      }
+    }
+    if (corrections.isNotEmpty) await writeJournal('records', corrections);
+    final journal = <String, Map<String, Map<String, Object?>>>{};
+    for (final kind in ['versions', 'records', 'pauses', 'meta']) {
+      journal[kind] = await loadJournal(kind);
+    }
+    return encodeBackup(
+      await loadItems(includeArchived: true),
+      journal,
+      await loadThemeColor(),
+    );
+  }
+
+  @override
+  Future<void> importBackup(String source) async {
+    final backup = DailyBackup.parse(source);
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('completions');
+      await txn.delete('reminder_times');
+      await txn.delete('items');
+      await txn.delete('journal');
+      final allTimes = <int, ReminderTime>{};
+      for (final version in (backup.journal['versions'] ?? {}).values) {
+        final item = itemFromJson(
+          Map<String, Object?>.from(version['item'] as Map),
+        );
+        for (final time in item.times) {
+          allTimes[time.id!] = time;
+        }
+      }
+      for (final raw in (backup.journal['records'] ?? {}).values) {
+        final record = OccurrenceRecord.fromJson(raw);
+        for (final time in record.item.times) {
+          allTimes[time.id!] = time;
+        }
+        allTimes[record.time.id!] = record.time;
+      }
+      for (final item in backup.items) {
+        await txn.insert('items', {'id': item.id, ..._itemValues(item)});
+        for (final time in item.times) {
+          allTimes[time.id!] = time;
+        }
+      }
+      for (final time in allTimes.values) {
+        final active = backup.items.any(
+          (i) => i.id == time.itemId && i.times.any((t) => t.id == time.id),
+        );
+        await txn.insert('reminder_times', {
+          'id': time.id,
+          'item_id': time.itemId,
+          'minute_of_day': time.minuteOfDay,
+          'sort_order': time.sortOrder,
+          'active': active ? 1 : 0,
+        });
+      }
+      for (final kind in backup.journal.entries) {
+        await _writeJournal(txn, kind.key, kind.value);
+      }
+      for (final raw in (backup.journal['records'] ?? {}).values) {
+        final record = OccurrenceRecord.fromJson(raw);
+        if (record.status != OccurrenceStatus.completed) continue;
+        await txn.insert('completions', {
+          'item_id': record.item.id,
+          'reminder_time_id': record.time.id,
+          'occurrence_date': dayKey(record.date),
+          'completed_at': record.changedAt.toIso8601String(),
+          'quantity_used': record.quantityUsed,
+        });
+      }
+      await txn.insert('app_settings', {
+        'key': 'theme_color',
+        'value': backup.theme.name,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    });
+  }
+
   Map<String, Object?> _itemValues(ReminderItem item) {
     return <String, Object?>{
       'title': item.title.trim(),
+      'note': item.note,
       'icon_key': item.iconKey,
       'start_date': dayKey(item.startDate),
       'end_date': item.endDate == null ? null : dayKey(item.endDate!),
@@ -446,6 +655,7 @@ class SqliteDailyStore implements DailyStore {
     return ReminderItem(
       id: row['id'] as int,
       title: row['title'] as String,
+      note: row['note'] as String? ?? '',
       iconKey: row['icon_key'] as String,
       startDate: parseDay(row['start_date'] as String),
       endDate: row['end_date'] == null

@@ -1125,7 +1125,7 @@ void main() {
       }
 
       await toggle(0);
-      expectOrder([1, 2, 0]);
+      expectOrder([2, 1, 0]);
       await toggle(1);
       expectOrder([2, 1, 0]);
       await toggle(2);
@@ -1297,7 +1297,7 @@ void main() {
     expect(find.byType(SettingsPage), findsOneWidget);
   });
 
-  testWidgets('undoing a deletion preserves completion history', (
+  testWidgets('archiving and restoring preserves completion history', (
     tester,
   ) async {
     await setPhoneSize(tester);
@@ -1316,12 +1316,15 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byType(PopupMenuButton<String>));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('删除'));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 200));
-
-    expect(find.text('撤销'), findsOneWidget);
-    await tester.tap(find.text('撤销'));
+    await tester.tap(find.text('归档事项'));
+    await tester.pumpAndSettle();
+    expect(await store.loadItems(), isEmpty);
+    expect(await store.completionCount(), 1);
+    await tester.tap(find.byKey(const Key('item-filter-archived')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(PopupMenuButton<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('恢复事项'));
     await tester.pumpAndSettle();
 
     expect(await store.completionCount(), 1);
@@ -1400,14 +1403,9 @@ void main() {
       await scrollEditorUntilVisible(tester, intervalOption);
       await tester.tap(intervalOption);
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('editor-sheet-done')));
+      await tester.tap(find.byKey(const Key('repeat-interval-row')));
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('editor-time-settings')));
-      await tester.pumpAndSettle();
-      final frequencyRow = find.byKey(const Key('frequency-picker-row'));
-      await scrollEditorUntilVisible(tester, frequencyRow);
-      await tester.tap(frequencyRow);
-      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('frequency-times-wheel')), findsNothing);
       tester
           .widget<CupertinoPicker>(
             find.byKey(const Key('frequency-days-wheel')),
@@ -1436,64 +1434,62 @@ void main() {
     },
   );
 
-  testWidgets('frequency wheels set every two days and three times', (
+  testWidgets('repeat dates and reminder counts are configured separately', (
     tester,
   ) async {
     await setPhoneSize(tester);
     final store = MemoryDailyStore();
     await pumpDaily(tester, store);
-
     await tester.tap(find.byKey(const Key('add-item-button')));
     await tester.pumpAndSettle();
     await tester.enterText(find.byKey(const Key('item-title-field')), '测试药品');
+    await tester.tap(find.byKey(const Key('editor-repeat-settings')));
+    await tester.pumpAndSettle();
+    expect(find.text('提醒次数'), findsNothing);
+    await tester.tap(find.text('隔几天'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('repeat-interval-row')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('frequency-times-wheel')), findsNothing);
+    tester
+        .widget<CupertinoPicker>(find.byKey(const Key('frequency-days-wheel')))
+        .onSelectedItemChanged!(2);
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('frequency-picker-cancel')));
+    await tester.pumpAndSettle();
+    expect(find.text('2 天'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('editor-sheet-done')));
+    await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('editor-time-settings')));
     await tester.pumpAndSettle();
     final frequencyRow = find.byKey(const Key('frequency-picker-row'));
-    await scrollEditorUntilVisible(tester, frequencyRow);
     await tester.tap(frequencyRow);
     await tester.pumpAndSettle();
-
-    var daysWheel = tester.widget<CupertinoPicker>(
-      find.byKey(const Key('frequency-days-wheel')),
-    );
-    var timesWheel = tester.widget<CupertinoPicker>(
-      find.byKey(const Key('frequency-times-wheel')),
-    );
-    daysWheel.onSelectedItemChanged!(1);
-    timesWheel.onSelectedItemChanged!(2);
+    expect(find.byKey(const Key('frequency-days-wheel')), findsNothing);
+    tester
+        .widget<CupertinoPicker>(find.byKey(const Key('frequency-times-wheel')))
+        .onSelectedItemChanged!(2);
     await tester.pump();
-    expect(find.text('每 2 天 · 3 次'), findsOneWidget);
-
+    expect(find.text('当天提醒 3 次'), findsOneWidget);
     await tester.tap(find.byKey(const Key('frequency-picker-cancel')));
     await tester.pumpAndSettle();
-    expect(find.text('每天 · 1 次'), findsOneWidget);
+    expect(find.text('1 次'), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('editor-time-1')), findsNothing);
-
     await tester.tap(frequencyRow);
     await tester.pumpAndSettle();
-    daysWheel = tester.widget<CupertinoPicker>(
-      find.byKey(const Key('frequency-days-wheel')),
-    );
-    timesWheel = tester.widget<CupertinoPicker>(
-      find.byKey(const Key('frequency-times-wheel')),
-    );
-    daysWheel.onSelectedItemChanged!(1);
-    timesWheel.onSelectedItemChanged!(2);
+    tester
+        .widget<CupertinoPicker>(find.byKey(const Key('frequency-times-wheel')))
+        .onSelectedItemChanged!(2);
     await tester.pump();
     await tester.tap(find.byKey(const Key('frequency-picker-confirm')));
     await tester.pumpAndSettle();
-
-    expect(find.text('每 2 天 · 3 次'), findsOneWidget);
+    expect(find.text('3 次'), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('editor-time-2')), findsOneWidget);
-
     await tester.tap(find.byKey(const Key('editor-sheet-done')));
     await tester.pumpAndSettle();
-    final saveButton = find.byKey(const Key('save-item-button'));
-    await scrollEditorUntilVisible(tester, saveButton);
-    await tester.tap(saveButton);
+    await tester.tap(find.byKey(const Key('save-item-button')));
     await tester.pumpAndSettle();
-
     final item = (await store.loadItems()).single;
     expect(item.repeatKind, RepeatKind.interval);
     expect(item.intervalDays, 2);
@@ -1521,7 +1517,7 @@ void main() {
     await tester.tap(frequencyRow);
     await tester.pump();
 
-    expect(find.byKey(const Key('frequency-days-wheel')), findsOneWidget);
+    expect(find.byKey(const Key('frequency-days-wheel')), findsNothing);
     tester
         .widget<CupertinoPicker>(find.byKey(const Key('frequency-times-wheel')))
         .onSelectedItemChanged!(1);
@@ -1530,7 +1526,7 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const Key('frequency-times-wheel')), findsNothing);
-    expect(find.text('每天 · 2 次'), findsOneWidget);
+    expect(find.text('2 次'), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('editor-time-1')), findsOneWidget);
   });
 
@@ -1599,6 +1595,8 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      await tester.tap(find.text('从今天起的长期安排'));
+      await tester.pumpAndSettle();
       await enterTime(tester, '10', '30');
       final updated = (await store.loadItems()).single;
       expect(updated.times.single.minuteOfDay, 630);
@@ -1642,6 +1640,8 @@ void main() {
     await tester.tap(
       find.descendant(of: dose, matching: find.byType(InkWell)).first,
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('仅这一次'));
     await tester.pumpAndSettle();
     await enterTime(tester, '13', '00');
     expect(find.text('这个提醒时间已经存在'), findsOneWidget);
@@ -1700,6 +1700,7 @@ void main() {
       await tester.tap(find.byKey(const Key('tab-items')));
       await tester.pumpAndSettle();
       await tester.tap(find.text('感冒药'));
+      await tester.pump(const Duration(milliseconds: 350));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('stock-quantity-field')), findsNothing);
       await tester.enterText(find.byKey(const Key('item-title-field')), '新的名称');

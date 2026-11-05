@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+
+part 'history.dart';
 
 enum RepeatKind { daily, weekly, interval }
 
@@ -107,10 +110,12 @@ class ReminderItem {
     this.alertWeekBefore = true,
     this.archived = false,
     this.createdAt,
+    this.note = '',
   });
 
   final int? id;
   final String title;
+  final String note;
   final String iconKey;
   final DateTime startDate;
   final DateTime? endDate;
@@ -179,6 +184,7 @@ class ReminderItem {
   ReminderItem copyWith({
     int? id,
     String? title,
+    String? note,
     String? iconKey,
     DateTime? startDate,
     DateTime? endDate,
@@ -207,6 +213,7 @@ class ReminderItem {
     return ReminderItem(
       id: id ?? this.id,
       title: title ?? this.title,
+      note: note ?? this.note,
       iconKey: iconKey ?? this.iconKey,
       startDate: startDate ?? this.startDate,
       endDate: clearEndDate ? null : (endDate ?? this.endDate),
@@ -240,12 +247,37 @@ class DayTaskGroup {
     required this.date,
     required this.completedKeys,
     this.completionTimes = const {},
+    this.records = const {},
   });
 
   final ReminderItem item;
   final DateTime date;
   final Set<String> completedKeys;
   final Map<String, DateTime> completionTimes;
+  final Map<String, OccurrenceRecord> records;
+
+  OccurrenceRecord? recordFor(ReminderTime time) =>
+      item.id == null || time.id == null
+      ? null
+      : records[completionKey(item.id!, time.id!, date)];
+  OccurrenceStatus statusFor(ReminderTime time) =>
+      recordFor(time)?.status ??
+      (isCompleted(time)
+          ? OccurrenceStatus.completed
+          : OccurrenceStatus.pending);
+  bool isExcluded(ReminderTime time) => {
+    OccurrenceStatus.skipped,
+    OccurrenceStatus.paused,
+  }.contains(statusFor(time));
+  int get excludedCount => item.times.where(isExcluded).length;
+  bool get allResolved =>
+      item.times.every((time) => isCompleted(time) || isExcluded(time));
+  int get nextMinute => item.times
+      .where((time) => !isCompleted(time) && !isExcluded(time))
+      .fold<int>(
+        1440,
+        (value, time) => time.minuteOfDay < value ? time.minuteOfDay : value,
+      );
 
   List<ReminderTime> get orderedTimes {
     final result = List<ReminderTime>.from(item.times);
@@ -321,6 +353,22 @@ class DeletedReminder {
 abstract class DailyStore {
   Future<void> initialize();
 
+  Future<Map<String, Map<String, Object?>>> loadJournal(
+    String kind, {
+    String? key,
+    DateTime? from,
+    DateTime? to,
+  });
+  Future<void> writeJournal(
+    String kind,
+    Map<String, Map<String, Object?>> entries, {
+    bool onlyIfAbsent = false,
+    bool onlyIfPending = false,
+  });
+  Future<String> exportBackup();
+  Future<void> importBackup(String source);
+  DailyHistory get history => DailyHistory(this);
+
   Future<DailyThemeColor> loadThemeColor();
 
   Future<void> saveThemeColor(DailyThemeColor color);
@@ -348,7 +396,7 @@ abstract class DailyStore {
   Future<int> completionCount();
 }
 
-class MemoryDailyStore implements DailyStore {
+class MemoryDailyStore extends DailyStore {
   MemoryDailyStore({List<ReminderItem> seedItems = const <ReminderItem>[]})
     : _items = <ReminderItem>[] {
     for (final item in seedItems) {
@@ -358,6 +406,116 @@ class MemoryDailyStore implements DailyStore {
 
   final List<ReminderItem> _items;
   final Map<String, DeletedCompletion> _completions = {};
+  final Map<String, Map<String, Map<String, Object?>>> _journal = {};
+  @override
+  Future<Map<String, Map<String, Object?>>> loadJournal(
+    String kind, {
+    String? key,
+    DateTime? from,
+    DateTime? to,
+  }) async => {
+    for (final entry in (_journal[kind] ?? {}).entries)
+      if ((key == null || entry.key == key) &&
+          (from == null ||
+              entry.key
+                      .substring(entry.key.length - 10)
+                      .compareTo(dayKey(from)) >=
+                  0) &&
+          (to == null ||
+              entry.key
+                      .substring(entry.key.length - 10)
+                      .compareTo(dayKey(to)) <=
+                  0))
+        entry.key: entry.value,
+  };
+  @override
+  Future<void> writeJournal(
+    String kind,
+    Map<String, Map<String, Object?>> entries, {
+    bool onlyIfAbsent = false,
+    bool onlyIfPending = false,
+  }) async {
+    final target = _journal[kind] ??= {};
+    for (final entry in entries.entries) {
+      if (onlyIfPending && target[entry.key]?['status'] != 'pending') continue;
+      if (!onlyIfAbsent || !target.containsKey(entry.key)) {
+        target[entry.key] = entry.value;
+      }
+    }
+  }
+
+  Future<void> _captureVersion(ReminderItem? old, ReminderItem saved) async {
+    final versions = await loadJournal('versions');
+    await writeJournal('versions', planVersionChanges(versions, old, saved));
+  }
+
+  @override
+  Future<String> exportBackup() async {
+    await history.reconcile();
+    await history.loadDay(DateTime.now());
+    for (final entry in _completions.entries.toList()) {
+      if (!(await loadJournal('records')).containsKey(entry.key)) {
+        final parts = entry.key.split(':');
+        await history.recordCompletion(
+          int.parse(parts[0]),
+          int.parse(parts[1]),
+          entry.value.date,
+          true,
+          completedAt: entry.value.completedAt,
+        );
+      }
+    }
+    return encodeBackup(
+      await loadItems(includeArchived: true),
+      _journal,
+      _themeColor,
+    );
+  }
+
+  @override
+  Future<void> importBackup(String source) async {
+    final backup = DailyBackup.parse(source);
+    _items.clear();
+    _completions.clear();
+    _journal.clear();
+    _themeColor = backup.theme;
+    _nextItemId = 1;
+    _nextTimeId = 1;
+    for (final item in backup.items) {
+      _items.add(_assignIds(item));
+    }
+    for (final entry in backup.journal.entries) {
+      _journal[entry.key] = Map.from(entry.value);
+    }
+    for (final raw in (await loadJournal('versions')).values) {
+      final version = itemFromJson(
+        Map<String, Object?>.from(raw['item'] as Map),
+      );
+      for (final time in version.times) {
+        if (time.id! >= _nextTimeId) {
+          _nextTimeId = time.id! + 1;
+        }
+      }
+    }
+    for (final record in (await loadJournal(
+      'records',
+    )).values.map(OccurrenceRecord.fromJson)) {
+      for (final time in [...record.item.times, record.time]) {
+        if (time.id! >= _nextTimeId) {
+          _nextTimeId = time.id! + 1;
+        }
+      }
+      if (record.status == OccurrenceStatus.completed) {
+        _completions[record.key] = DeletedCompletion(
+          reminderTimeId: record.time.id!,
+          date: record.date,
+          completedAt: record.changedAt,
+          quantityUsed: record.quantityUsed,
+        );
+      }
+    }
+  }
+
   int _nextItemId = 1;
   int _nextTimeId = 1;
   DailyThemeColor _themeColor = DailyThemeColor.sage;
@@ -401,34 +559,12 @@ class MemoryDailyStore implements DailyStore {
     if (item.id == null) {
       final saved = _assignIds(item);
       _items.add(saved);
+      await _captureVersion(null, saved);
       return saved.copyWith(usedQuantity: saved.usedQuantityBase);
     }
     final index = _items.indexWhere((entry) => entry.id == item.id);
     var saved = _assignIds(item);
-    if (index >= 0) {
-      final retainedIds = saved.times
-          .map((time) => time.id)
-          .whereType<int>()
-          .toSet();
-      final removedIds = _items[index].times
-          .map((time) => time.id)
-          .whereType<int>()
-          .where((id) => !retainedIds.contains(id))
-          .toSet();
-      var removedUsage = 0.0;
-      _completions.removeWhere((key, completion) {
-        final parts = key.split(':');
-        final remove =
-            parts.length == 3 &&
-            int.tryParse(parts[0]) == item.id &&
-            removedIds.contains(int.tryParse(parts[1]));
-        if (remove) removedUsage += completion.quantityUsed;
-        return remove;
-      });
-      saved = saved.copyWith(
-        usedQuantityBase: _items[index].usedQuantityBase + removedUsage,
-      );
-    }
+    await _captureVersion(index < 0 ? null : _items[index], saved);
     if (index == -1) {
       _items.add(saved);
     } else {
@@ -487,7 +623,11 @@ class MemoryDailyStore implements DailyStore {
     final key = completionKey(itemId, reminderTimeId, date);
     if (completed) {
       if (_completions.containsKey(key)) return;
-      final item = _items.where((entry) => entry.id == itemId).first;
+      final item = (await history.occurrence(
+        itemId,
+        reminderTimeId,
+        date,
+      )).item;
       _completions[key] = DeletedCompletion(
         reminderTimeId: reminderTimeId,
         date: dateOnly(date),
@@ -497,6 +637,13 @@ class MemoryDailyStore implements DailyStore {
     } else {
       _completions.remove(key);
     }
+    await history.recordCompletion(
+      itemId,
+      reminderTimeId,
+      date,
+      completed,
+      completedAt: completedAt,
+    );
   }
 
   @override

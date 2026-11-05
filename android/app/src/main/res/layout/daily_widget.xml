@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:id="@+id/widget_root" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:padding="18dp" android:background="@drawable/widget_background">
+<TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Daily." android:textColor="#143D32" android:textStyle="bold" android:textSize="21sp" />
+<TextView android:id="@+id/widget_progress" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="已完成 0/0" android:textColor="#155E4E" android:textSize="15sp" />
+<ProgressBar android:id="@+id/widget_bar" style="?android:attr/progressBarStyleHorizontal" android:layout_width="match_parent" android:layout_height="4dp" android:layout_marginTop="8dp" android:progressTint="#155E4E" android:progressBackgroundTint="#D9E2D6" />
+<TextView android:id="@+id/widget_tasks" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="10dp" android:textColor="#36564A" android:textSize="13sp" android:maxLines="3" android:ellipsize="end" />
+</LinearLayout>

@@ -465,17 +465,33 @@ class _MotionReorderColumnState extends State<MotionReorderColumn> {
     child: Stack(
       children: [
         for (final child in widget.children)
-          AnimatedPositioned(
+          Positioned(
             key: ValueKey<Key>(child.key!),
-            duration: appMotion(context, 240),
-            curve: Curves.easeInOutCubic,
-            top: _order.indexOf(child.key!) * (widget.extent + widget.spacing),
+            top: 0,
             left: 0,
             right: 0,
             height: widget.extent,
-            child: Semantics(
-              sortKey: OrdinalSortKey(_order.indexOf(child.key!).toDouble()),
-              child: child,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(
+                begin:
+                    _order.indexOf(child.key!) *
+                    (widget.extent + widget.spacing),
+                end:
+                    _order.indexOf(child.key!) *
+                    (widget.extent + widget.spacing),
+              ),
+              duration: appMotion(context, 240),
+              curve: Curves.easeInOutCubic,
+              builder: (context, top, entry) =>
+                  Transform.translate(offset: Offset(0, top), child: entry),
+              child: RepaintBoundary(
+                child: Semantics(
+                  sortKey: OrdinalSortKey(
+                    _order.indexOf(child.key!).toDouble(),
+                  ),
+                  child: child,
+                ),
+              ),
             ),
           ),
       ],

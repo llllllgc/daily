@@ -96,6 +96,57 @@ List<PlannedReminder> buildNotificationSchedulePlan({
   return plan.take(limit).toList(growable: false);
 }
 
+/// Expand current plans into date-specific reminders, applying local exceptions.
+Future<List<ReminderItem>> notificationItems(
+  DailyStore store,
+  List<ReminderItem> items,
+  DateTime now,
+) async {
+  final records = await store.loadJournal(
+    'records',
+    from: dateOnly(now),
+    to: DateTime(
+      now.year,
+      now.month,
+      now.day + notificationSchedulingHorizonDays,
+    ),
+  );
+  final pauses = (await store.loadJournal('pauses')).values;
+  final result = <ReminderItem>[];
+  for (var offset = 0; offset < notificationSchedulingHorizonDays; offset++) {
+    final date = DateTime(now.year, now.month, now.day + offset);
+    for (final item in items) {
+      if (!item.isScheduledOn(date)) continue;
+      if (pauses.any((p) => pauseCoversDate(p, item.id!, date))) continue;
+      final times = <ReminderTime>[];
+      for (final time in item.times) {
+        final raw = records[completionKey(item.id!, time.id!, date)];
+        final record = raw == null ? null : OccurrenceRecord.fromJson(raw);
+        if (record != null &&
+            {
+              OccurrenceStatus.completed,
+              OccurrenceStatus.skipped,
+              OccurrenceStatus.paused,
+            }.contains(record.status)) {
+          continue;
+        }
+        times.add(record?.time ?? time);
+      }
+      if (times.isNotEmpty) {
+        result.add(
+          item.copyWith(
+            startDate: date,
+            endDate: date,
+            repeatKind: RepeatKind.daily,
+            times: times,
+          ),
+        );
+      }
+    }
+  }
+  return result;
+}
+
 Set<int> obsoleteManagedNotificationIds({
   required List<PendingNotificationSnapshot> pending,
   required Set<int> desiredIds,
@@ -257,6 +308,20 @@ Future<bool> completeNotificationOccurrence({
   required NotificationPayload payload,
 }) async {
   if (payload.isTest || payload.itemId <= 0 || payload.reminderTimeId <= 0) {
+    return false;
+  }
+  final items = await store.loadItems(includeArchived: true);
+  final current = items.where((item) => item.id == payload.itemId).firstOrNull;
+  if (current == null || current.archived) return false;
+  final raw = (await store.loadJournal(
+    'records',
+  ))[completionKey(payload.itemId, payload.reminderTimeId, payload.date)];
+  if (raw != null && {'skipped', 'paused'}.contains(raw['status'])) {
+    return false;
+  }
+  if ((await store.loadJournal(
+    'pauses',
+  )).values.any((p) => pauseCoversDate(p, payload.itemId, payload.date))) {
     return false;
   }
   await store.setCompletion(
@@ -610,8 +675,9 @@ class NotificationService implements ReminderScheduler {
   Future<void> _sync(List<ReminderItem> items) async {
     if (!_isSupported) return;
     await initialize();
+    final reminderItems = await notificationItems(store, items, DateTime.now());
     if (_isIOS) {
-      await _syncIOS(items);
+      await _syncIOS(items, reminderItems);
       return;
     }
     final now = tz.TZDateTime.now(tz.local);
@@ -636,7 +702,7 @@ class NotificationService implements ReminderScheduler {
     final reminderLimit = (notificationSchedulingLimit - cyclePlan.length)
         .clamp(0, notificationSchedulingLimit);
     final reminderPlan = buildNotificationSchedulePlan(
-      items: items,
+      items: reminderItems,
       now: localNow,
       limit: reminderLimit,
     );
@@ -754,7 +820,10 @@ class NotificationService implements ReminderScheduler {
     return plan.take(notificationSchedulingLimit).toList(growable: false);
   }
 
-  Future<void> _syncIOS(List<ReminderItem> items) async {
+  Future<void> _syncIOS(
+    List<ReminderItem> items,
+    List<ReminderItem> reminderItems,
+  ) async {
     if (!_isSupported) return;
     await initialize();
     final pending = await _plugin.pendingNotificationRequests();
@@ -765,7 +834,7 @@ class NotificationService implements ReminderScheduler {
           payload != null &&
           payload.isSnoozed &&
           (payload.isTest ||
-              items.any(
+              reminderItems.any(
                 (item) =>
                     item.id == payload.itemId &&
                     item.isScheduledOn(payload.date) &&
@@ -783,7 +852,9 @@ class NotificationService implements ReminderScheduler {
     final schedule = <_ScheduledNotification>[];
     for (var offset = 0; offset <= 30; offset++) {
       final date = firstDay.add(Duration(days: offset));
-      for (final item in items.where((entry) => entry.isScheduledOn(date))) {
+      for (final item in reminderItems.where(
+        (entry) => entry.isScheduledOn(date),
+      )) {
         final itemId = item.id;
         if (itemId == null) continue;
         for (final time in item.times) {

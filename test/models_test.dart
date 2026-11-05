@@ -154,9 +154,9 @@ void main() {
       completed: true,
     );
     item = await store.saveItem(item.copyWith(times: [item.times.last]));
-    expect(item.usedQuantityBase, 1);
+    expect(item.usedQuantityBase, 0);
     expect(item.remainingQuantity, 5);
-    expect(await store.completionCount(), 0);
+    expect(await store.completionCount(), 1);
     final deleted = await store.deleteItem(item.id!);
     await store.restoreDeletedItem(deleted!);
     expect((await store.loadItems()).single.remainingQuantity, 5);

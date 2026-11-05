@@ -14,6 +14,8 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import 'models.dart';
+import 'pages/item_detail_page.dart';
+import 'services/device_bridge.dart';
 import 'services/notification_service.dart';
 import 'theme.dart';
 import 'item_icons.dart';
@@ -335,6 +337,8 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   late final _buttonOrigin = ButtonOriginController();
   int _selectedIndex = 0;
   int _revision = 0;
+  int _calendarRevision = 0;
+  Timer? _completionMaintenance;
   StreamSubscription<void>? _refreshSubscription;
   bool _exactAlarmHintShown = false;
   bool _editingTime = false;
@@ -353,6 +357,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _refreshSubscription?.cancel();
+    _completionMaintenance?.cancel();
     super.dispose();
   }
 
@@ -360,17 +365,45 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _refresh();
-      unawaited(_syncNotifications());
+    } else if (_completionMaintenance?.isActive ?? false) {
+      _flushCompletionMaintenance();
     }
   }
 
-  void _refresh() {
-    if (mounted) setState(() => _revision++);
+  void _completionChanged() {
+    _completionMaintenance?.cancel();
+    _completionMaintenance = Timer(
+      const Duration(milliseconds: 600),
+      _flushCompletionMaintenance,
+    );
+  }
+
+  void _flushCompletionMaintenance() {
+    _completionMaintenance?.cancel();
+    if (!mounted) return;
+    setState(() => _revision++);
+    unawaited(_syncNotifications());
+  }
+
+  void _refresh({bool synchronize = true}) {
+    if (mounted) {
+      _completionMaintenance?.cancel();
+      setState(() {
+        _revision++;
+        _calendarRevision++;
+      });
+      if (synchronize) unawaited(_syncNotifications());
+    }
   }
 
   Future<void> _syncNotifications() async {
     final items = await widget.store.loadItems();
     await widget.scheduler.sync(items);
+    unawaited(
+      DeviceBridge.updateWidget(widget.store).catchError((Object error) {
+        debugPrint('Daily widget refresh failed: $error');
+      }),
+    );
   }
 
   Future<void> _openEditor([ReminderItem? item]) async {
@@ -388,7 +421,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
           : MaterialPageRoute<bool>(builder: editor),
     );
     if (saved ?? false) {
-      _refresh();
+      _refresh(synchronize: false);
       await _syncNotifications();
       await _showExactAlarmHintIfNeeded();
     }
@@ -397,28 +430,67 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   Future<void> _openSettings() async {
     ScaffoldMessenger.of(context).clearSnackBars();
     final origin = _buttonOrigin.take();
+    var dataChanged = false;
     Widget settings(BuildContext context) => SettingsPage(
       store: widget.store,
       scheduler: widget.scheduler,
       revision: _revision,
+      onDataChanged: () => dataChanged = true,
     );
-    await Navigator.of(context).push<void>(
-      origin != null
-          ? ButtonOriginPageRoute<void>(
-              origin: origin,
-              reduceMotion: MediaQuery.disableAnimationsOf(context),
-              builder: settings,
-            )
-          : MaterialPageRoute<void>(builder: settings),
-    );
-    _refresh();
+    final route = origin != null
+        ? ButtonOriginPageRoute<void>(
+            origin: origin,
+            reduceMotion: MediaQuery.disableAnimationsOf(context),
+            builder: settings,
+          )
+        : MaterialPageRoute<void>(builder: settings);
+    await Navigator.of(context).push<void>(route);
+    // Restoring a backup changes the plans. Wait until the return animation
+    // finishes before reloading them; a normal settings visit needs no reload.
+    await route.completed;
+    if (dataChanged) _refresh(synchronize: false);
   }
 
-  Future<void> _editReminderTime(ReminderItem item, ReminderTime time) async {
+  Future<void> _editReminderTime(
+    ReminderItem item,
+    ReminderTime time, [
+    DateTime? occurrenceDate,
+  ]) async {
     if (_editingTime) return;
     _editingTime = true;
     var saved = false;
     try {
+      String? scope = 'future';
+      if (occurrenceDate != null) {
+        scope = await showModalBottomSheet<String>(
+          context: context,
+          showDragHandle: true,
+          useSafeArea: true,
+          builder: (ctx) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: const Text('修改提醒时间'),
+                subtitle: Text('${dayKey(occurrenceDate)} · ${time.label}'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.event_outlined),
+                title: const Text('仅这一次'),
+                subtitle: const Text('其他日期保持原安排'),
+                onTap: () => Navigator.pop(ctx, 'once'),
+              ),
+              if (!dateOnly(occurrenceDate).isBefore(dateOnly(DateTime.now())))
+                ListTile(
+                  leading: const Icon(Icons.repeat),
+                  title: const Text('从今天起的长期安排'),
+                  subtitle: const Text('历史记录保留原时间'),
+                  onTap: () => Navigator.pop(ctx, 'future'),
+                ),
+            ],
+          ),
+        );
+        if (scope == null || !mounted) return;
+      }
       final picked = await showTimePicker(
         context: context,
         helpText: '修改提醒时间',
@@ -431,6 +503,18 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
       if (picked == null || !mounted) return;
       final minute = picked.hour * 60 + picked.minute;
       if (minute == time.minuteOfDay) return;
+      if (scope == 'once' && occurrenceDate != null) {
+        await widget.store.history.changeOnce(
+          item,
+          time,
+          occurrenceDate,
+          minute,
+        );
+        saved = true;
+        _refresh(synchronize: false);
+        await _syncNotifications();
+        return;
+      }
       final items = await widget.store.loadItems(includeArchived: true);
       final matches = items.where((entry) => entry.id == item.id);
       if (matches.isEmpty) return;
@@ -464,7 +548,7 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
         ),
       );
       saved = true;
-      _refresh();
+      _refresh(synchronize: false);
       await _syncNotifications();
       if (mounted) {
         HapticFeedback.selectionClick();
@@ -472,11 +556,17 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
           context,
         ).showSnackBar(const SnackBar(content: Text('提醒时间已更新')));
       }
-    } on Object {
+    } on Object catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(saved ? '时间已保存，提醒同步失败，请在设置中重试' : '未能修改提醒时间，请再试一次'),
+            content: Text(
+              saved
+                  ? '时间已保存，提醒同步失败，请在设置中重试'
+                  : error is StateError
+                  ? error.message.toString()
+                  : '未能修改提醒时间，请再试一次',
+            ),
           ),
         );
       }
@@ -519,7 +609,8 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
     final pages = <Widget>[
       CalendarPage(
         store: widget.store,
-        revision: _revision,
+        revision: _calendarRevision,
+        onCompletionChanged: _completionChanged,
         onAdd: _openEditor,
         onOpenSettings: _openSettings,
         onDataChanged: _refresh,
@@ -581,6 +672,7 @@ class CalendarPage extends StatefulWidget {
     required this.onOpenSettings,
     required this.onDataChanged,
     required this.onEditTime,
+    this.onCompletionChanged,
     super.key,
   });
 
@@ -589,7 +681,8 @@ class CalendarPage extends StatefulWidget {
   final VoidCallback onAdd;
   final VoidCallback onOpenSettings;
   final VoidCallback onDataChanged;
-  final void Function(ReminderItem, ReminderTime) onEditTime;
+  final VoidCallback? onCompletionChanged;
+  final void Function(ReminderItem, ReminderTime, DateTime) onEditTime;
 
   @override
   State<CalendarPage> createState() => _CalendarPageState();
@@ -598,7 +691,7 @@ class CalendarPage extends StatefulWidget {
 class _CalendarPageState extends State<CalendarPage> {
   late DateTime _selectedDate;
   late DateTime _visibleMonth;
-  List<ReminderItem> _items = const [];
+  Map<String, List<DayTaskGroup>> _historyDays = {};
   Map<String, DateTime> _completionTimes = const {};
   final Set<int> _expandedItemIds = <int>{};
   final Set<String> _completionWrites = <String>{};
@@ -630,16 +723,20 @@ class _CalendarPageState extends State<CalendarPage> {
   Future<void> _load() async {
     final version = ++_loadVersion;
     final start = _gridStart;
-    final results = await Future.wait<Object>([
-      widget.store.loadItems(),
-      widget.store.loadCompletionTimes(
-        start,
-        DateTime(start.year, start.month, start.day + 41),
-      ),
-    ]);
+    final loadedDays = await widget.store.history.loadDays(
+      start,
+      DateTime(start.year, start.month, start.day + 41),
+    );
+    final results = <Object>[
+      loadedDays,
+      {
+        for (final groups in loadedDays.values)
+          for (final group in groups) ...group.completionTimes,
+      },
+    ];
     if (!mounted || version != _loadVersion) return;
     setState(() {
-      _items = results[0] as List<ReminderItem>;
+      _historyDays = loadedDays;
       final completions = Map<String, DateTime>.from(
         results[1] as Map<String, DateTime>,
       );
@@ -653,7 +750,9 @@ class _CalendarPageState extends State<CalendarPage> {
       }
       _completionTimes = completions;
       _expandedItemIds.removeWhere(
-        (id) => !_items.any((item) => item.id == id),
+        (id) => !loadedDays.values
+            .expand((groups) => groups)
+            .any((group) => group.item.id == id),
       );
       _loading = false;
     });
@@ -661,22 +760,23 @@ class _CalendarPageState extends State<CalendarPage> {
 
   List<DayTaskGroup> get _groups {
     final completionKeys = _completionTimes.keys.toSet();
-    final groups = _items
-        .where((item) => item.isScheduledOn(_selectedDate))
+    final groups = (_historyDays[dayKey(_selectedDate)] ?? [])
         .map(
-          (item) => DayTaskGroup(
-            item: item,
-            date: _selectedDate,
+          (group) => DayTaskGroup(
+            item: group.item,
+            date: group.date,
             completedKeys: completionKeys,
             completionTimes: _completionTimes,
+            records: group.records,
           ),
         )
-        .toList(growable: false);
+        .toList();
+    groups.sort((a, b) => a.nextMinute.compareTo(b.nextMinute));
     final originalOrder = {
       for (var index = 0; index < groups.length; index++)
         groups[index].item.id: index,
     };
-    final completedGroups = groups.where((group) => group.allCompleted).toList()
+    final completedGroups = groups.where((group) => group.allResolved).toList()
       ..sort((a, b) {
         final aCompletedAt = a.lastCompletedAt;
         final bCompletedAt = b.lastCompletedAt;
@@ -687,7 +787,7 @@ class _CalendarPageState extends State<CalendarPage> {
         return originalOrder[a.item.id]!.compareTo(originalOrder[b.item.id]!);
       });
     return <DayTaskGroup>[
-      ...groups.where((group) => !group.allCompleted),
+      ...groups.where((group) => !group.allResolved),
       ...completedGroups,
     ];
   }
@@ -707,6 +807,16 @@ class _CalendarPageState extends State<CalendarPage> {
     final timeId = time.id;
     if (itemId == null || timeId == null) return;
     final occurrenceDate = dateOnly(group.date);
+    if (occurrenceDate.isAfter(dateOnly(DateTime.now()))) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('未来日期仅预览计划')));
+      return;
+    }
+    if (group.isExcluded(time)) {
+      await _occurrenceActions(group, time);
+      return;
+    }
     final key = completionKey(itemId, timeId, occurrenceDate);
     final now = DateTime.now();
     if (_completionWrites.contains(key)) return;
@@ -738,7 +848,8 @@ class _CalendarPageState extends State<CalendarPage> {
         completed: nextValue,
         completedAt: nextValue ? now : null,
       );
-      widget.onDataChanged();
+      if (mounted) _cacheCompletion(group, time, nextValue, now);
+      (widget.onCompletionChanged ?? widget.onDataChanged)();
       _completionWrites.remove(key);
       if (!mounted) return;
       HapticFeedback.selectionClick();
@@ -790,17 +901,121 @@ class _CalendarPageState extends State<CalendarPage> {
     }
   }
 
+  void _cacheCompletion(
+    DayTaskGroup group,
+    ReminderTime time,
+    bool completed,
+    DateTime now,
+  ) {
+    final key = completionKey(group.item.id!, time.id!, group.date);
+    final original =
+        group.recordFor(time) ??
+        OccurrenceRecord(
+          item: group.item,
+          time: time,
+          date: group.date,
+          status: OccurrenceStatus.pending,
+          changedAt: now,
+        );
+    final quantity = completed
+        ? (original.item.stockQuantity == null
+              ? 0.0
+              : original.item.doseQuantity)
+        : (original.quantityUsed != 0
+              ? original.quantityUsed
+              : original.item.stockQuantity == null
+              ? 0.0
+              : original.item.doseQuantity);
+    final record = original.copyWith(
+      status: completed
+          ? OccurrenceStatus.completed
+          : group.date.isBefore(dateOnly(now))
+          ? OccurrenceStatus.missed
+          : OccurrenceStatus.pending,
+      changedAt: now,
+      quantityUsed: completed ? quantity : 0,
+    );
+    final completedKeys = _completionTimes.keys.toSet();
+    final today = dateOnly(now);
+    setState(() {
+      _historyDays = {
+        for (final entry in _historyDays.entries)
+          entry.key: [
+            for (final cached in entry.value)
+              if (cached.item.id != group.item.id)
+                cached
+              else
+                DayTaskGroup(
+                  item: cached.date.isBefore(today)
+                      ? cached.item
+                      : cached.item.copyWith(
+                          usedQuantity:
+                              cached.item.usedQuantity +
+                              (completed ? quantity : -quantity),
+                        ),
+                  date: cached.date,
+                  completedKeys: completedKeys,
+                  completionTimes: _completionTimes,
+                  records: dayKey(cached.date) == dayKey(group.date)
+                      ? {...cached.records, key: record}
+                      : cached.records,
+                ),
+          ],
+      };
+    });
+  }
+
+  Future<void> _openDetails(ReminderItem item) async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => ItemDetailPage(
+          store: widget.store,
+          item: item,
+          onChanged: () async {
+            widget.onDataChanged();
+            await _load();
+          },
+        ),
+      ),
+    );
+    await _load();
+  }
+
+  Future<void> _occurrenceActions(DayTaskGroup group, ReminderTime time) async {
+    final record =
+        group.recordFor(time) ??
+        OccurrenceRecord(
+          item: group.item,
+          time: time,
+          date: group.date,
+          status: group.statusFor(time),
+          changedAt: DateTime.now(),
+        );
+    final result = await showOccurrenceActions(context, record);
+    if (result == null) return;
+    try {
+      await widget.store.history.setStatus(record, result.$1, note: result.$2);
+      widget.onDataChanged();
+      await _load();
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('未能保存本次状态，请重试')));
+      }
+    }
+  }
+
   Color? _statusFor(DateTime date) {
     var total = 0;
     var completed = 0;
-    for (final item in _items.where((entry) => entry.isScheduledOn(date))) {
-      for (final time in item.times) {
+    for (final group in _historyDays[dayKey(date)] ?? <DayTaskGroup>[]) {
+      for (final time in group.item.times) {
+        if (group.isExcluded(time)) continue;
         total++;
-        final itemId = item.id;
-        final timeId = time.id;
-        if (itemId != null &&
-            timeId != null &&
-            _completionTimes.containsKey(completionKey(itemId, timeId, date))) {
+        if (_completionTimes.containsKey(
+          completionKey(group.item.id!, time.id!, date),
+        )) {
           completed++;
         }
       }
@@ -917,21 +1132,16 @@ class _CalendarPageState extends State<CalendarPage> {
               onOpenSettings: widget.onOpenSettings,
             ),
             const SizedBox(height: 18),
-            _MotionAnimatedSize(
-              milliseconds: 220,
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.topCenter,
-              child: SwipePeriod(
-                key: const Key('calendar-swipe-area'),
-                onChanged: _changePeriod,
-                adjacentBuilder: _adjacentCalendar,
-                child: CalendarDates(
-                  expanded: _monthExpanded,
-                  visibleMonth: _visibleMonth,
-                  selectedDate: _selectedDate,
-                  statusFor: _statusFor,
-                  onSelected: _selectDate,
-                ),
+            SwipePeriod(
+              key: const Key('calendar-swipe-area'),
+              onChanged: _changePeriod,
+              adjacentBuilder: _adjacentCalendar,
+              child: CalendarDates(
+                expanded: _monthExpanded,
+                visibleMonth: _visibleMonth,
+                selectedDate: _selectedDate,
+                statusFor: _statusFor,
+                onSelected: _selectDate,
               ),
             ),
             const SizedBox(height: 18),
@@ -978,8 +1188,14 @@ class _CalendarPageState extends State<CalendarPage> {
                                   : null,
                               onToggleCompletion: (time) =>
                                   _toggleCompletion(group, time),
-                              onEditTime: (time) =>
-                                  widget.onEditTime(group.item, time),
+                              onEditTime: (time) => widget.onEditTime(
+                                group.item,
+                                time,
+                                group.date,
+                              ),
+                              onOpenDetails: () => _openDetails(group.item),
+                              onOccurrenceActions: (time) =>
+                                  _occurrenceActions(group, time),
                             ),
                           ),
                       ],
@@ -1084,23 +1300,40 @@ class _AnimatedOrderColumnState extends State<_AnimatedOrderColumn> {
           clipBehavior: Clip.none,
           children: [
             for (final entry in entries)
-              AnimatedPositioned(
+              Positioned(
                 key: ValueKey<Object>(entry.id),
-                duration: duration,
-                curve: Curves.easeInOutCubic,
-                top: positions[entry.id]!,
+                top: 0,
                 left: 0,
                 right: 0,
-                child: _MeasureSize(
-                  onChange: (size) {
-                    if (!mounted ||
-                        !widget.entries.any((item) => item.id == entry.id)) {
-                      return;
-                    }
-                    if (_heights[entry.id] == size.height) return;
-                    setState(() => _heights[entry.id] = size.height);
-                  },
-                  child: entry.child,
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(
+                    begin: positions[entry.id]!,
+                    end: positions[entry.id]!,
+                  ),
+                  duration: duration,
+                  curve: Curves.easeInOutCubic,
+                  builder: (context, top, child) =>
+                      Transform.translate(offset: Offset(0, top), child: child),
+                  child: RepaintBoundary(
+                    child: _MeasureSize(
+                      onChange: (size) {
+                        if (!mounted ||
+                            !widget.entries.any(
+                              (item) => item.id == entry.id,
+                            )) {
+                          return;
+                        }
+                        if (_heights[entry.id] == size.height) return;
+                        setState(() => _heights[entry.id] = size.height);
+                      },
+                      child: Semantics(
+                        sortKey: OrdinalSortKey(
+                          _order.indexOf(entry.id).toDouble(),
+                        ),
+                        child: entry.child,
+                      ),
+                    ),
+                  ),
                 ),
               ),
           ],
@@ -1238,8 +1471,8 @@ class CalendarHeader extends StatelessWidget {
                       const SizedBox(width: 4),
                       AnimatedRotation(
                         turns: monthExpanded ? 0.5 : 0,
-                        duration: appMotion(context, 220),
-                        curve: Curves.easeOutCubic,
+                        duration: appMotion(context, 320),
+                        curve: Curves.easeInOutCubic,
                         child: const Icon(Icons.expand_more_rounded, size: 20),
                       ),
                     ],
@@ -1318,9 +1551,25 @@ class CalendarDates extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final target = expanded ? 1.0 : 0.0;
+    if (MediaQuery.disableAnimationsOf(context)) {
+      return _buildDates(context, target);
+    }
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: target, end: target),
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeInOutCubic,
+      builder: (context, progress, _) => _buildDates(context, progress),
+    );
+  }
+
+  Widget _buildDates(BuildContext context, double progress) {
     const labels = ['日', '一', '二', '三', '四', '五', '六'];
+    const rowHeight = 52.0;
     final first = DateTime(visibleMonth.year, visibleMonth.month);
-    final gridStart = _weekStart(expanded ? first : selectedDate);
+    final gridStart = _weekStart(first);
+    final selectedRow = (selectedDate.day - 1 + first.weekday % 7) ~/ 7;
+    final otherRowsOpacity = Curves.easeIn.transform(progress);
     return Column(
       children: [
         Row(
@@ -1338,33 +1587,65 @@ class CalendarDates extends StatelessWidget {
               .toList(growable: false),
         ),
         const SizedBox(height: 6),
-        GridView.builder(
-          padding: EdgeInsets.zero,
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: expanded ? 42 : 7,
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 7,
-            mainAxisExtent: 52,
+        SizedBox(
+          height: rowHeight * (1 + 5 * progress),
+          child: ClipRect(
+            child: Stack(
+              children: [
+                for (var row = 0; row < 6; row++)
+                  if (progress > 0 || row == selectedRow)
+                    Positioned(
+                      key: ValueKey<String>(
+                        'calendar-week-${dayKey(DateTime(gridStart.year, gridStart.month, gridStart.day + row * 7))}',
+                      ),
+                      // Keep the selected week visible as it moves into place.
+                      top:
+                          (row - selectedRow) * rowHeight +
+                          selectedRow * rowHeight * progress,
+                      left: 0,
+                      right: 0,
+                      height: rowHeight,
+                      child: IgnorePointer(
+                        ignoring:
+                            row != selectedRow && (!expanded || progress < 1),
+                        child: ExcludeSemantics(
+                          excluding:
+                              row != selectedRow && (!expanded || progress < 1),
+                          child: Opacity(
+                            opacity: row == selectedRow ? 1 : otherRowsOpacity,
+                            child: Row(
+                              children: [
+                                for (var column = 0; column < 7; column++)
+                                  Expanded(
+                                    child: _dayCell(
+                                      DateTime(
+                                        gridStart.year,
+                                        gridStart.month,
+                                        gridStart.day + row * 7 + column,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+              ],
+            ),
           ),
-          itemBuilder: (context, index) {
-            final date = DateTime(
-              gridStart.year,
-              gridStart.month,
-              gridStart.day + index,
-            );
-            return CalendarDayCell(
-              date: date,
-              inMonth: date.month == visibleMonth.month,
-              selected: dayKey(date) == dayKey(selectedDate),
-              statusColor: statusFor(date),
-              onTap: () => onSelected(date),
-            );
-          },
         ),
       ],
     );
   }
+
+  Widget _dayCell(DateTime date) => CalendarDayCell(
+    date: date,
+    inMonth: date.month == visibleMonth.month,
+    selected: dayKey(date) == dayKey(selectedDate),
+    statusColor: statusFor(date),
+    onTap: () => onSelected(date),
+  );
 }
 
 class CalendarDayCell extends StatelessWidget {
@@ -1479,19 +1760,74 @@ class DailySummary extends StatelessWidget {
               style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
-          if (total > 0)
+          if (total > 0) ...[
+            Text(
+              '已完成 $completed/$total',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(width: 10),
             CompletionProgressRing(
               key: ValueKey('daily-progress-${dayKey(date)}'),
               completed: completed,
               total: total,
               semanticLabel: '当天完成进度',
-            )
-          else
+            ),
+          ] else
             Text('暂无事项', style: Theme.of(context).textTheme.bodyMedium),
         ],
       ),
     );
   }
+}
+
+/// Single taps expand immediately; a second tap opens the detail page.
+class _TaskInkWell extends StatefulWidget {
+  const _TaskInkWell({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.onDoubleTap,
+    this.onLongPress,
+    this.deferSingleTap = false,
+  });
+  final Widget child;
+  final bool deferSingleTap;
+  final VoidCallback? onTap, onDoubleTap, onLongPress;
+  @override
+  State<_TaskInkWell> createState() => _TaskInkWellState();
+}
+
+class _TaskInkWellState extends State<_TaskInkWell> {
+  Timer? _doubleTapWindow;
+  void _tap() {
+    if (_doubleTapWindow?.isActive ?? false) {
+      _doubleTapWindow!.cancel();
+      widget.onDoubleTap?.call();
+    } else {
+      if (widget.deferSingleTap) {
+        _doubleTapWindow = Timer(
+          const Duration(milliseconds: 300),
+          () => widget.onTap?.call(),
+        );
+      } else {
+        widget.onTap?.call();
+        _doubleTapWindow = Timer(const Duration(milliseconds: 300), () {});
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _doubleTapWindow?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: _tap,
+    onLongPress: widget.onLongPress,
+    child: widget.child,
+  );
 }
 
 class TaskGroupView extends StatelessWidget {
@@ -1501,6 +1837,8 @@ class TaskGroupView extends StatelessWidget {
     required this.onToggleExpanded,
     required this.onToggleCompletion,
     this.onEditTime,
+    this.onOpenDetails,
+    this.onOccurrenceActions,
     super.key,
   });
 
@@ -1509,6 +1847,8 @@ class TaskGroupView extends StatelessWidget {
   final VoidCallback? onToggleExpanded;
   final ValueChanged<ReminderTime> onToggleCompletion;
   final ValueChanged<ReminderTime>? onEditTime;
+  final VoidCallback? onOpenDetails;
+  final ValueChanged<ReminderTime>? onOccurrenceActions;
 
   @override
   Widget build(BuildContext context) {
@@ -1532,9 +1872,15 @@ class TaskGroupView extends StatelessWidget {
             baseColor: context.palette.completionFill,
             completedColor: context.palette.parentNote,
             borderRadius: BorderRadius.circular(AppRadii.large),
-            child: InkWell(
+            child: _TaskInkWell(
               key: ValueKey<String>('task-${group.item.id}'),
               onTap: isMultiple ? onToggleExpanded : null,
+              onDoubleTap: onOpenDetails,
+              onLongPress: onOccurrenceActions == null
+                  ? null
+                  : () => isMultiple
+                        ? onOpenDetails?.call()
+                        : onOccurrenceActions!(onlyTime!),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(minHeight: 66),
                 child: Padding(
@@ -1566,11 +1912,39 @@ class TaskGroupView extends StatelessWidget {
                                   ),
                             ),
                             const SizedBox(height: 3),
+                            if (onlyTime != null &&
+                                {
+                                  OccurrenceStatus.missed,
+                                  OccurrenceStatus.skipped,
+                                  OccurrenceStatus.paused,
+                                }.contains(group.statusFor(onlyTime)))
+                              Text(
+                                group.statusFor(onlyTime).label,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color:
+                                      group.statusFor(onlyTime) ==
+                                          OccurrenceStatus.missed
+                                      ? context.palette.missed
+                                      : context.palette.muted,
+                                ),
+                              ),
+                            if (onlyTime != null &&
+                                (group.recordFor(onlyTime)?.note.isNotEmpty ??
+                                    false))
+                              Text(
+                                group.recordFor(onlyTime)!.note,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
                             if (onlyTime == null) ...[
                               Text(
-                                parentCompleted
-                                    ? '当天已完成'
-                                    : '下一次 ${group.item.times.where((time) => !group.isCompleted(time)).first.label} · 剩 ${group.item.times.length - group.completedCount} 次',
+                                group.allResolved
+                                    ? (parentCompleted
+                                          ? '当天已完成'
+                                          : '当天已处理 · 跳过或暂停 ${group.excludedCount} 次')
+                                    : '下一次 ${group.item.times.where((time) => !group.isCompleted(time) && !group.isExcluded(time)).first.label} · 剩 ${group.item.times.length - group.completedCount} 次',
                                 key: ValueKey<String>(
                                   'next-time-${group.item.id}',
                                 ),
@@ -1656,11 +2030,21 @@ class TaskGroupView extends StatelessWidget {
                             color: context.palette.muted,
                           ),
                         ),
-                      ] else
+                      ] else if (group.isExcluded(onlyTime!))
+                        IconButton(
+                          tooltip: '本次${group.statusFor(onlyTime).label}，点击修改',
+                          onPressed: () => onOccurrenceActions?.call(onlyTime),
+                          icon: Icon(
+                            group.statusFor(onlyTime) == OccurrenceStatus.paused
+                                ? Icons.pause_circle_outline
+                                : Icons.skip_next_rounded,
+                          ),
+                        )
+                      else
                         CompletionButton(
                           key: ValueKey<String>('completion-${group.item.id}'),
                           completed: singleCompleted,
-                          onPressed: () => onToggleCompletion(onlyTime!),
+                          onPressed: () => onToggleCompletion(onlyTime),
                         ),
                     ],
                   ),
@@ -1675,6 +2059,7 @@ class TaskGroupView extends StatelessWidget {
             group: group,
             onToggleCompletion: onToggleCompletion,
             onEditTime: onEditTime,
+            onOccurrenceActions: onOccurrenceActions,
           ),
         ),
       ],
@@ -1687,12 +2072,14 @@ class DoseRail extends StatelessWidget {
     required this.group,
     required this.onToggleCompletion,
     this.onEditTime,
+    this.onOccurrenceActions,
     super.key,
   });
 
   final DayTaskGroup group;
   final ValueChanged<ReminderTime> onToggleCompletion;
   final ValueChanged<ReminderTime>? onEditTime;
+  final ValueChanged<ReminderTime>? onOccurrenceActions;
 
   @override
   Widget build(BuildContext context) {
@@ -1775,6 +2162,10 @@ class DoseRail extends StatelessWidget {
                       time: times[index],
                       sequence: times[index].sortOrder + 1,
                       completed: group.isCompleted(times[index]),
+                      status: group.statusFor(times[index]),
+                      onLongPress: onOccurrenceActions == null
+                          ? null
+                          : () => onOccurrenceActions!(times[index]),
                       stacked: stackedRows[times[index]]!,
                       onPressed: () => onToggleCompletion(times[index]),
                       onEditTime: onEditTime == null
@@ -1799,6 +2190,8 @@ class DoseRow extends StatelessWidget {
     required this.onPressed,
     this.onEditTime,
     this.stacked = false,
+    this.status = OccurrenceStatus.pending,
+    this.onLongPress,
     super.key,
   });
 
@@ -1808,96 +2201,101 @@ class DoseRow extends StatelessWidget {
   final VoidCallback onPressed;
   final VoidCallback? onEditTime;
   final bool stacked;
+  final OccurrenceStatus status;
+  final VoidCallback? onLongPress;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        SizedBox(
-          width: 21,
-          child: Center(
-            child: Container(
-              width: 7,
-              height: 7,
-              decoration: BoxDecoration(
-                color: completed
-                    ? context.palette.mutedLight
-                    : context.palette.statusSage,
-                shape: BoxShape.circle,
+    return GestureDetector(
+      onLongPress: onLongPress,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 21,
+            child: Center(
+              child: Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: completed
+                      ? context.palette.mutedLight
+                      : context.palette.statusSage,
+                  shape: BoxShape.circle,
+                ),
               ),
             ),
           ),
-        ),
-        const SizedBox(width: 7),
-        Expanded(
-          child: CompletionFillSurface(
-            completed: completed,
-            baseColor: context.palette.completionFill,
-            completedColor: context.palette.parentNote,
-            borderRadius: BorderRadius.circular(AppRadii.medium),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(minHeight: 58),
-              child: stacked
-                  ? Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  '第 $sequence 次',
-                                  style: Theme.of(context).textTheme.bodyLarge
-                                      ?.copyWith(
-                                        color: completed
-                                            ? context.palette.muted
-                                            : context.palette.ink,
-                                      ),
+          const SizedBox(width: 7),
+          Expanded(
+            child: CompletionFillSurface(
+              completed: completed,
+              baseColor: context.palette.completionFill,
+              completedColor: context.palette.parentNote,
+              borderRadius: BorderRadius.circular(AppRadii.medium),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 58),
+                child: stacked
+                    ? Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    '第 $sequence 次${status == OccurrenceStatus.pending || status == OccurrenceStatus.completed ? '' : ' · ${status.label}'}',
+                                    style: Theme.of(context).textTheme.bodyLarge
+                                        ?.copyWith(
+                                          color: completed
+                                              ? context.palette.muted
+                                              : context.palette.ink,
+                                        ),
+                                  ),
                                 ),
-                              ),
-                              CompletionButton(
-                                completed: completed,
-                                onPressed: onPressed,
-                              ),
-                            ],
+                                CompletionButton(
+                                  completed: completed,
+                                  onPressed: onPressed,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            _TimeEditChip(
+                              time: time,
+                              onTap: onEditTime,
+                              compact: true,
+                            ),
+                          ],
+                        ),
+                      )
+                    : Row(
+                        children: [
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Text(
+                              '第 $sequence 次${status == OccurrenceStatus.pending || status == OccurrenceStatus.completed ? '' : ' · ${status.label}'}',
+                              style: Theme.of(context).textTheme.bodyLarge
+                                  ?.copyWith(
+                                    color: completed
+                                        ? context.palette.muted
+                                        : context.palette.ink,
+                                  ),
+                            ),
                           ),
-                          const SizedBox(height: 4),
-                          _TimeEditChip(
-                            time: time,
-                            onTap: onEditTime,
-                            compact: true,
+                          _TimeEditChip(time: time, onTap: onEditTime),
+                          const SizedBox(width: 4),
+                          CompletionButton(
+                            completed: completed,
+                            onPressed: onPressed,
                           ),
                         ],
                       ),
-                    )
-                  : Row(
-                      children: [
-                        const SizedBox(width: 14),
-                        Expanded(
-                          child: Text(
-                            '第 $sequence 次',
-                            style: Theme.of(context).textTheme.bodyLarge
-                                ?.copyWith(
-                                  color: completed
-                                      ? context.palette.muted
-                                      : context.palette.ink,
-                                ),
-                          ),
-                        ),
-                        _TimeEditChip(time: time, onTap: onEditTime),
-                        const SizedBox(width: 4),
-                        CompletionButton(
-                          completed: completed,
-                          onPressed: onPressed,
-                        ),
-                      ],
-                    ),
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
@@ -2225,6 +2623,7 @@ class ItemEditorPage extends StatefulWidget {
 class _ItemEditorPageState extends State<ItemEditorPage> {
   final _formKey = GlobalKey<FormState>();
   late final TextEditingController _titleController;
+  late final TextEditingController _noteController;
   late String _iconKey;
   late DateTime _startDate;
   late DateTime? _endDate;
@@ -2244,12 +2643,6 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
   bool _saving = false;
   bool _iconChoicesExpanded = false;
 
-  String get _frequencyLabel => switch (_repeatKind) {
-    RepeatKind.daily => '每天 · ${_times.length} 次',
-    RepeatKind.weekly => '选定日 · ${_times.length} 次',
-    RepeatKind.interval => '每 $_intervalDays 天 · ${_times.length} 次',
-  };
-
   int get _frequencyDays => switch (_repeatKind) {
     RepeatKind.daily => 1,
     RepeatKind.weekly => _intervalDays.clamp(2, 365),
@@ -2262,6 +2655,7 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     final item = widget.item;
     final today = dateOnly(DateTime.now());
     _titleController = TextEditingController(text: item?.title ?? '');
+    _noteController = TextEditingController(text: item?.note ?? '');
     _iconKey = item?.iconKey ?? 'medication';
     _startDate = item?.startDate ?? today;
     _endDate = item?.endDate;
@@ -2294,6 +2688,7 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
   @override
   void dispose() {
     _titleController.dispose();
+    _noteController.dispose();
     _stockController.dispose();
     _doseController.dispose();
     super.dispose();
@@ -2308,30 +2703,78 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     );
   }
 
-  Future<void> _pickStartDate() async {
-    final picked = await _pickDate(_startDate);
-    if (picked == null || !mounted) return;
+  int get _durationDays => _endDate == null
+      ? 7
+      : DateTime.utc(_endDate!.year, _endDate!.month, _endDate!.day)
+                .difference(
+                  DateTime.utc(
+                    _startDate.year,
+                    _startDate.month,
+                    _startDate.day,
+                  ),
+                )
+                .inDays +
+            1;
+
+  Future<void> _pickDuration() async {
+    final days = await showModalBottomSheet<int>(
+      context: context,
+      useSafeArea: true,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: context.palette.canvasRaised,
+      constraints: const BoxConstraints(maxWidth: 560),
+      sheetAnimationStyle: AnimationStyle(
+        duration: appMotion(context, 280),
+        reverseDuration: appMotion(context, 220),
+      ),
+      builder: (_) => _DurationPickerSheet(
+        initialDays: _durationDays,
+        startDate: _startDate,
+      ),
+    );
+    if (days == null || !mounted) return;
     setState(() {
-      _startDate = dateOnly(picked);
-      if (_endDate != null && _endDate!.isBefore(_startDate)) {
-        _endDate = _startDate;
-      }
+      _endDate = DateTime(
+        _startDate.year,
+        _startDate.month,
+        _startDate.day + days - 1,
+      );
     });
   }
 
-  Future<void> _pickEndDate() async {
-    final picked = await _pickDate(
-      _endDate ?? _startDate.add(const Duration(days: 7)),
+  Future<void> _pickDateRange() async {
+    final range = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+      initialDateRange: DateTimeRange(
+        start: _startDate,
+        end: _endDate ?? _startDate,
+      ),
+      helpText: '选择日期范围（含起止当天）',
+      saveText: '确定',
+      builder: (context, child) {
+        final theme = Theme.of(context);
+        return LayoutBuilder(
+          builder: (context, constraints) => Theme(
+            data: theme.copyWith(
+              datePickerTheme: theme.datePickerTheme.copyWith(
+                rangePickerHeaderHeadlineStyle: constraints.maxWidth < 360
+                    ? theme.textTheme.titleMedium
+                    : theme.textTheme.titleLarge,
+              ),
+            ),
+            child: child!,
+          ),
+        );
+      },
     );
-    if (picked == null || !mounted) return;
-    if (dateOnly(picked).isBefore(_startDate)) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('结束日期不能早于开始日期')));
-      return;
-    }
-    setState(() => _endDate = dateOnly(picked));
+    if (range == null || !mounted) return;
+    setState(() {
+      _startDate = dateOnly(range.start);
+      _endDate = dateOnly(range.end);
+    });
   }
 
   Future<void> _pickProductionDate() async {
@@ -2382,7 +2825,7 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     });
   }
 
-  Future<void> _pickFrequency() async {
+  Future<void> _pickFrequency({bool scheduleOnly = false}) async {
     FocusScope.of(context).unfocus();
     final selection = await showModalBottomSheet<_FrequencySelection>(
       context: context,
@@ -2399,18 +2842,20 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
       builder: (context) => _FrequencyPickerSheet(
         initialDays: _frequencyDays,
         initialTimes: _times.length.clamp(1, 8),
-        allowDaySelection: _repeatKind != RepeatKind.weekly,
+        allowDaySelection: scheduleOnly,
+        allowTimesSelection: !scheduleOnly,
       ),
     );
     if (selection == null || !mounted) return;
     setState(() {
-      if (_repeatKind != RepeatKind.weekly) {
+      if (scheduleOnly) {
         _intervalDays = selection.days;
         _repeatKind = selection.days == 1
             ? RepeatKind.daily
             : RepeatKind.interval;
+      } else {
+        _resizeTimes(selection.times);
       }
-      _resizeTimes(selection.times);
     });
     HapticFeedback.lightImpact();
   }
@@ -2477,6 +2922,7 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
       final item = ReminderItem(
         id: widget.item?.id,
         title: _titleController.text.trim(),
+        note: _noteController.text.trim(),
         iconKey: _iconKey,
         startDate: _startDate,
         endDate: _endDate,
@@ -2531,7 +2977,14 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
     final start = _startDate == dateOnly(DateTime.now())
         ? '今天起'
         : '${_startDate.month}/${_startDate.day} 起';
-    return '$start · ${_endDate == null ? '长期' : '${_endDate!.month}/${_endDate!.day} 结束'}';
+    return '$start · ${_endDate == null ? '长期' : '持续 $_durationDays 天'}';
+  }
+
+  String get _dateRangeLabel {
+    final start = dayKey(_startDate).replaceAll('-', '/');
+    if (_endDate == null) return '$start 起';
+    final end = dayKey(_endDate!).replaceAll('-', '/');
+    return '$start\n至 $end';
   }
 
   String get _timeSummary => _times.length == 1
@@ -2691,25 +3144,55 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
         ),
         const SizedBox(height: 16),
         if (_repeatKind == RepeatKind.weekly) ...[
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: List.generate(7, (index) {
-              final day = index + 1;
-              return FilterChip(
-                key: ValueKey<String>('editor-weekday-$day'),
-                label: Text(const ['一', '二', '三', '四', '五', '六', '日'][index]),
-                selected: _weekdays.contains(day),
-                showCheckmark: false,
-                onSelected: (selected) {
-                  setState(() {
-                    selected ? _weekdays.add(day) : _weekdays.remove(day);
-                  });
-                  refresh(() {});
-                  HapticFeedback.selectionClick();
-                },
-              );
-            }),
+          Row(
+            key: const Key('editor-weekdays'),
+            children: [
+              for (var index = 0; index < 7; index++) ...[
+                if (index > 0) const SizedBox(width: 4),
+                Expanded(
+                  child: Builder(
+                    builder: (context) {
+                      final day = index + 1;
+                      return SizedBox(
+                        height: 44,
+                        child: FilterChip(
+                          key: ValueKey<String>('editor-weekday-$day'),
+                          tooltip: const [
+                            '星期一',
+                            '星期二',
+                            '星期三',
+                            '星期四',
+                            '星期五',
+                            '星期六',
+                            '星期日',
+                          ][index],
+                          label: Center(
+                            child: Text(
+                              const ['一', '二', '三', '四', '五', '六', '日'][index],
+                            ),
+                          ),
+                          padding: EdgeInsets.zero,
+                          labelPadding: EdgeInsets.zero,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          selected: _weekdays.contains(day),
+                          showCheckmark: false,
+                          onSelected: (selected) {
+                            setState(() {
+                              selected
+                                  ? _weekdays.add(day)
+                                  : _weekdays.remove(day);
+                            });
+                            refresh(() {});
+                            HapticFeedback.selectionClick();
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ],
           ),
           const SizedBox(height: 8),
           Text(
@@ -2721,13 +3204,18 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                   : context.palette.muted,
             ),
           ),
-        ] else ...[
+        ] else if (_repeatKind == RepeatKind.interval) ...[
           _EditorSurface(
             child: _EditorSettingRow(
+              key: const Key('repeat-interval-row'),
               icon: Icons.repeat_rounded,
-              label: '频率与次数',
-              value: _frequencyLabel,
-              onTap: () => _refreshSheetAfter(context, refresh, _pickFrequency),
+              label: '间隔天数',
+              value: '$_intervalDays 天',
+              onTap: () => _refreshSheetAfter(
+                context,
+                refresh,
+                () => _pickFrequency(scheduleOnly: true),
+              ),
             ),
           ),
         ],
@@ -2743,8 +3231,8 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
           _EditorSettingRow(
             key: const Key('frequency-picker-row'),
             icon: Icons.repeat_rounded,
-            label: '提醒频率',
-            value: _frequencyLabel,
+            label: '提醒次数',
+            value: '${_times.length} 次',
             onTap: () => _refreshSheetAfter(context, refresh, _pickFrequency),
           ),
           const Divider(indent: 46, endIndent: 16),
@@ -2767,34 +3255,54 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
 
   Future<void> _showDateSettings() => _showEditorSheet(
     title: '日期范围',
-    content: (context, refresh) => _EditorSurface(
-      child: Column(
-        children: [
-          _EditorSettingRow(
-            icon: Icons.calendar_today_outlined,
-            label: '开始日期',
-            value: yearDate(_startDate),
-            onTap: () => _refreshSheetAfter(context, refresh, _pickStartDate),
+    content: (context, refresh) => Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SegmentedButton<bool>(
+          segments: const [
+            ButtonSegment(value: false, label: Text('长期')),
+            ButtonSegment(value: true, label: Text('持续几天')),
+          ],
+          selected: {_endDate != null},
+          onSelectionChanged: (value) async {
+            if (value.single) {
+              await _refreshSheetAfter(context, refresh, _pickDuration);
+            } else {
+              setState(() => _endDate = null);
+              refresh(() {});
+            }
+          },
+        ),
+        const SizedBox(height: 16),
+        _EditorSurface(
+          child: Column(
+            children: [
+              _EditorSettingRow(
+                key: const Key('editor-date-range'),
+                icon: Icons.date_range_rounded,
+                label: '日期范围',
+                value: _dateRangeLabel,
+                onTap: () =>
+                    _refreshSheetAfter(context, refresh, _pickDateRange),
+              ),
+              const Divider(indent: 46, endIndent: 16),
+              _EditorSettingRow(
+                key: const Key('editor-duration-days'),
+                icon: Icons.timelapse_rounded,
+                label: '持续时间',
+                value: _endDate == null ? '长期' : '$_durationDays 天',
+                onTap: () =>
+                    _refreshSheetAfter(context, refresh, _pickDuration),
+              ),
+            ],
           ),
-          const Divider(indent: 46, endIndent: 16),
-          _EditorSettingRow(
-            icon: Icons.event_available_outlined,
-            label: '结束日期',
-            value: _endDate == null ? '长期' : yearDate(_endDate!),
-            onTap: () => _refreshSheetAfter(context, refresh, _pickEndDate),
-            trailing: _endDate == null
-                ? null
-                : IconButton(
-                    tooltip: '设为长期',
-                    onPressed: () {
-                      setState(() => _endDate = null);
-                      refresh(() {});
-                    },
-                    icon: const Icon(Icons.close_rounded, size: 18),
-                  ),
-          ),
-        ],
-      ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          '范围包含起止当天，同一天起止为 1 天。到期后停止安排，历史记录仍会保留。',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
     ),
   );
 
@@ -3209,6 +3717,14 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                     ),
                     const SizedBox(height: 20),
                     const _EditorSectionLabel('安排'),
+                    if (widget.item != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          '修改从今天起生效，历史安排与记录保留。',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ),
                     const SizedBox(height: 9),
                     _EditorSurface(
                       child: Column(
@@ -3237,6 +3753,21 @@ class _ItemEditorPageState extends State<ItemEditorPage> {
                             onTap: _showDateSettings,
                           ),
                         ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    _EditorSurface(
+                      padding: const EdgeInsets.all(16),
+                      child: TextFormField(
+                        controller: _noteController,
+                        maxLength: 500,
+                        minLines: 1,
+                        maxLines: 4,
+                        decoration: const InputDecoration(
+                          labelText: '备注',
+                          hintText: '事项说明（选填）',
+                          counterText: '',
+                        ),
                       ),
                     ),
                     const SizedBox(height: 16),
@@ -3601,6 +4132,98 @@ class FormActionRow extends StatelessWidget {
   }
 }
 
+class _DurationPickerSheet extends StatefulWidget {
+  const _DurationPickerSheet({
+    required this.initialDays,
+    required this.startDate,
+  });
+
+  final int initialDays;
+  final DateTime startDate;
+
+  @override
+  State<_DurationPickerSheet> createState() => _DurationPickerSheetState();
+}
+
+class _DurationPickerSheetState extends State<_DurationPickerSheet> {
+  late int _days = widget.initialDays;
+  late final _controller = FixedExtentScrollController(initialItem: _days - 1);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final end = DateTime(
+      widget.startDate.year,
+      widget.startDate.month,
+      widget.startDate.day + _days - 1,
+    );
+    // Keep an existing custom date selectable, including plans longer than a year.
+    final maximum = math.max(3650, widget.initialDays);
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('持续时间', style: Theme.of(context).textTheme.headlineMedium),
+            const SizedBox(height: 6),
+            Text(
+              '含开始当天 · ${yearDate(end)}结束',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 188,
+              child: CupertinoPicker.builder(
+                key: const Key('duration-days-wheel'),
+                scrollController: _controller,
+                itemExtent: 46,
+                useMagnifier: true,
+                magnification: 1.06,
+                childCount: maximum,
+                onSelectedItemChanged: (index) =>
+                    setState(() => _days = index + 1),
+                itemBuilder: (context, index) => Center(
+                  child: Text(
+                    '${index + 1} 天',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('取消'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton(
+                    key: const Key('duration-picker-confirm'),
+                    onPressed: () => Navigator.pop(context, _days),
+                    child: Text('持续 $_days 天'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _FrequencySelection {
   const _FrequencySelection({required this.days, required this.times});
 
@@ -3613,11 +4236,13 @@ class _FrequencyPickerSheet extends StatefulWidget {
     required this.initialDays,
     required this.initialTimes,
     required this.allowDaySelection,
+    required this.allowTimesSelection,
   });
 
   final int initialDays;
   final int initialTimes;
   final bool allowDaySelection;
+  final bool allowTimesSelection;
 
   @override
   State<_FrequencyPickerSheet> createState() => _FrequencyPickerSheetState();
@@ -3646,9 +4271,9 @@ class _FrequencyPickerSheetState extends State<_FrequencyPickerSheet> {
   }
 
   String get _summary {
-    if (!widget.allowDaySelection) return '每个选定日 · $_times 次';
-    if (_days == 1) return '每天 · $_times 次';
-    return '每 $_days 天 · $_times 次';
+    if (!widget.allowDaySelection) return '当天提醒 $_times 次';
+    if (_days == 1) return '每天执行';
+    return '每 $_days 天执行';
   }
 
   Widget _numberWheel({
@@ -3726,30 +4351,29 @@ class _FrequencyPickerSheetState extends State<_FrequencyPickerSheet> {
             ),
           ),
         ),
-      if (widget.allowDaySelection) const SizedBox(width: 12),
-      Expanded(
-        child: Semantics(
-          label: '当天次数',
-          value: '$_times 次',
-          child: Column(
-            children: [
-              Text(
-                widget.allowDaySelection ? '当天次数' : '每日次数',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              const SizedBox(height: 4),
-              _numberWheel(
-                key: const Key('frequency-times-wheel'),
-                controller: _timesController,
-                selectedValue: _times,
-                childCount: 8,
-                suffix: '次',
-                onChanged: (value) => setState(() => _times = value),
-              ),
-            ],
+      if (widget.allowDaySelection && widget.allowTimesSelection)
+        const SizedBox(width: 12),
+      if (widget.allowTimesSelection)
+        Expanded(
+          child: Semantics(
+            label: '当天提醒次数',
+            value: '$_times 次',
+            child: Column(
+              children: [
+                Text('当天提醒次数', style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 4),
+                _numberWheel(
+                  key: const Key('frequency-times-wheel'),
+                  controller: _timesController,
+                  selectedValue: _times,
+                  childCount: 8,
+                  suffix: '次',
+                  onChanged: (value) => setState(() => _times = value),
+                ),
+              ],
+            ),
           ),
         ),
-      ),
     ];
 
     return Padding(
@@ -3765,14 +4389,14 @@ class _FrequencyPickerSheetState extends State<_FrequencyPickerSheet> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '提醒频率',
+                      widget.allowDaySelection ? '重复间隔' : '提醒次数',
                       style: Theme.of(context).textTheme.headlineMedium,
                     ),
                     const SizedBox(height: 3),
                     Text(
                       widget.allowDaySelection
-                          ? '滚动设置间隔天数和当天次数'
-                          : '滚动设置每个选定日的次数',
+                          ? '设置每隔几天执行本事项'
+                          : '设置当天提醒次数，时间可分别调整',
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ],
@@ -3821,7 +4445,7 @@ class _FrequencyPickerSheetState extends State<_FrequencyPickerSheet> {
   }
 }
 
-enum _ItemFilter { active, ended, all }
+enum _ItemFilter { active, ended, archived, all }
 
 class ItemsPage extends StatefulWidget {
   const ItemsPage({
@@ -3881,53 +4505,47 @@ class _ItemsPageState extends State<ItemsPage> {
     _ItemFilter.active =>
       _items.where((item) => !item.hasEnded && !item.archived).toList(),
     _ItemFilter.ended =>
-      _items.where((item) => item.hasEnded || item.archived).toList(),
+      _items.where((item) => item.hasEnded && !item.archived).toList(),
+    _ItemFilter.archived => _items.where((item) => item.archived).toList(),
     _ItemFilter.all => _items,
   };
 
-  Future<void> _delete(ReminderItem item) async {
-    final itemId = item.id;
-    if (itemId == null) return;
-    final previous = List<ReminderItem>.from(_items);
-    setState(
-      () => _items = _items.where((entry) => entry.id != itemId).toList(),
-    );
+  Future<void> _archive(ReminderItem item) async {
     try {
-      final deleted = await widget.store.deleteItem(itemId);
-      if (deleted == null) throw StateError('Reminder no longer exists.');
+      await widget.store.saveItem(item.copyWith(archived: !item.archived));
       widget.onDataChanged();
       await widget.scheduler.sync(await widget.store.loadItems());
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          duration: const Duration(seconds: 7),
-          content: Text('已删除“${item.title}”'),
-          action: SnackBarAction(
-            label: '撤销',
-            onPressed: () async {
-              try {
-                await widget.store.restoreDeletedItem(deleted);
-                await widget.scheduler.sync(await widget.store.loadItems());
-                widget.onDataChanged();
-                await _load();
-              } on Object {
-                if (!mounted) return;
-                ScaffoldMessenger.of(
-                  context,
-                ).showSnackBar(const SnackBar(content: Text('未能恢复事项，请再试一次')));
-              }
-            },
-          ),
-        ),
-      );
+      await _load();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(item.archived ? '事项已恢复' : '事项已归档，历史记录保留')),
+        );
+      }
     } on Object {
-      if (!mounted) return;
-      setState(() => _items = previous);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('未能删除事项，请再试一次')));
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('未能更新事项，请重试')));
+      }
     }
+  }
+
+  Future<void> _details(ReminderItem item) async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ItemDetailPage(
+          store: widget.store,
+          item: item,
+          onChanged: () async {
+            widget.onDataChanged();
+            await widget.scheduler.sync(await widget.store.loadItems());
+            await _load();
+          },
+        ),
+      ),
+    );
+    await _load();
   }
 
   @override
@@ -3975,7 +4593,10 @@ class _ItemsPageState extends State<ItemsPage> {
                     .where((item) => !item.hasEnded && !item.archived)
                     .length,
                 _ItemFilter.ended: _items
-                    .where((item) => item.hasEnded || item.archived)
+                    .where((item) => item.hasEnded && !item.archived)
+                    .length,
+                _ItemFilter.archived: _items
+                    .where((item) => item.archived)
                     .length,
                 _ItemFilter.all: _items.length,
               },
@@ -3999,7 +4620,8 @@ class _ItemsPageState extends State<ItemsPage> {
                         child: _ManagementItemCard(
                           item: item,
                           onEdit: () => widget.onEdit(item),
-                          onDelete: () => _delete(item),
+                          onDelete: () => _archive(item),
+                          onDetails: () => _details(item),
                           onEditTime: (time) => widget.onEditTime(item, time),
                         ),
                       ),
@@ -4030,56 +4652,89 @@ class _ItemFilterBar extends StatelessWidget {
     const labels = {
       _ItemFilter.active: '进行中',
       _ItemFilter.ended: '已结束',
+      _ItemFilter.archived: '已归档',
       _ItemFilter.all: '全部',
     };
     return LayoutBuilder(
       builder: (context, constraints) {
-        final width = constraints.maxWidth / _ItemFilter.values.length;
-        return Stack(
-          children: [
-            AnimatedPositioned(
-              key: const Key('item-filter-indicator'),
-              duration: appMotion(context, 200),
-              curve: Curves.easeOutCubic,
-              left: selected.index * width,
-              width: math.max(0, width - 6),
-              top: 0,
-              bottom: 0,
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: context.palette.parentNote,
-                    borderRadius: BorderRadius.circular(AppRadii.medium),
-                  ),
-                ),
-              ),
+        final labelStyle = Theme.of(context).textTheme.labelLarge!;
+        var minimumWidth = 0.0;
+        for (final filter in _ItemFilter.values) {
+          final painter = TextPainter(
+            text: TextSpan(
+              text: '${labels[filter]} ${counts[filter] ?? 0}',
+              style: labelStyle,
             ),
-            Row(
-              children: _ItemFilter.values.map((filter) {
-                final active = selected == filter;
-                return Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: TextButton(
-                      key: ValueKey<String>('item-filter-${filter.name}'),
-                      onPressed: () => onSelected(filter),
-                      style: TextButton.styleFrom(
-                        minimumSize: const Size(0, 48),
-                        foregroundColor: active
-                            ? context.palette.ink
-                            : context.palette.muted,
-                        backgroundColor: Colors.transparent,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppRadii.medium),
-                        ),
+            textDirection: Directionality.of(context),
+            textScaler: MediaQuery.textScalerOf(context),
+          )..layout();
+          minimumWidth = math.max(minimumWidth, painter.width + 22);
+          painter.dispose();
+        }
+        final contentWidth = math.max(
+          constraints.maxWidth,
+          minimumWidth * _ItemFilter.values.length,
+        );
+        final width = contentWidth / _ItemFilter.values.length;
+        return SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SizedBox(
+            width: contentWidth,
+            child: Stack(
+              children: [
+                AnimatedPositioned(
+                  key: const Key('item-filter-indicator'),
+                  duration: appMotion(context, 200),
+                  curve: Curves.easeOutCubic,
+                  left: selected.index * width,
+                  width: math.max(0, width - 6),
+                  top: 0,
+                  bottom: 0,
+                  child: IgnorePointer(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: context.palette.parentNote,
+                        borderRadius: BorderRadius.circular(AppRadii.medium),
                       ),
-                      child: Text('${labels[filter]}  ${counts[filter] ?? 0}'),
                     ),
                   ),
-                );
-              }).toList(),
+                ),
+                Row(
+                  children: _ItemFilter.values.map((filter) {
+                    final active = selected == filter;
+                    return Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: TextButton(
+                          key: ValueKey<String>('item-filter-${filter.name}'),
+                          onPressed: () => onSelected(filter),
+                          style: TextButton.styleFrom(
+                            minimumSize: const Size(0, 48),
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            textStyle: labelStyle,
+                            foregroundColor: active
+                                ? context.palette.ink
+                                : context.palette.muted,
+                            backgroundColor: Colors.transparent,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(
+                                AppRadii.medium,
+                              ),
+                            ),
+                          ),
+                          child: Text(
+                            '${labels[filter]} ${counts[filter] ?? 0}',
+                            maxLines: 1,
+                            softWrap: false,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ],
             ),
-          ],
+          ),
         );
       },
     );
@@ -4091,12 +4746,14 @@ class _ManagementItemCard extends StatelessWidget {
     required this.item,
     required this.onEdit,
     required this.onDelete,
+    required this.onDetails,
     required this.onEditTime,
   });
 
   final ReminderItem item;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
+  final VoidCallback onDetails;
   final ValueChanged<ReminderTime> onEditTime;
 
   @override
@@ -4112,8 +4769,10 @@ class _ManagementItemCard extends StatelessWidget {
       elevation: ended ? 0 : 1,
       shadowColor: context.palette.pine.withValues(alpha: 0.13),
       clipBehavior: Clip.antiAlias,
-      child: InkWell(
+      child: _TaskInkWell(
+        deferSingleTap: true,
         onTap: onEdit,
+        onDoubleTap: onDetails,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 6, 4),
           child: Row(
@@ -4140,7 +4799,7 @@ class _ManagementItemCard extends StatelessWidget {
                           ),
                         ),
                         Text(
-                          '${item.times.length} 次/天',
+                          '当天 ${item.times.length} 次',
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                       ],
@@ -4199,11 +4858,16 @@ class _ManagementItemCard extends StatelessWidget {
                 tooltip: '更多操作',
                 onSelected: (value) {
                   if (value == 'edit') onEdit();
-                  if (value == 'delete') onDelete();
+                  if (value == 'archive') onDelete();
+                  if (value == 'details') onDetails();
                 },
-                itemBuilder: (_) => const [
+                itemBuilder: (_) => [
                   PopupMenuItem(value: 'edit', child: Text('编辑')),
-                  PopupMenuItem(value: 'delete', child: Text('删除')),
+                  const PopupMenuItem(value: 'details', child: Text('查看详情')),
+                  PopupMenuItem(
+                    value: 'archive',
+                    child: Text(item.archived ? '恢复事项' : '归档事项'),
+                  ),
                 ],
               ),
             ],
@@ -4222,7 +4886,8 @@ class _ItemsEmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final canAdd = filter != _ItemFilter.ended;
+    final canAdd =
+        filter != _ItemFilter.ended && filter != _ItemFilter.archived;
     return Padding(
       padding: const EdgeInsets.only(top: 72),
       child: Column(
@@ -4234,7 +4899,11 @@ class _ItemsEmptyState extends StatelessWidget {
           ),
           const SizedBox(height: 14),
           Text(
-            filter == _ItemFilter.ended ? '没有已结束事项' : '还没有事项',
+            filter == _ItemFilter.archived
+                ? '没有已归档事项'
+                : filter == _ItemFilter.ended
+                ? '没有已结束事项'
+                : '还没有事项',
             style: Theme.of(context).textTheme.titleMedium,
           ),
           const SizedBox(height: 6),
@@ -4268,6 +4937,7 @@ class SettingsPage extends StatefulWidget {
     required this.scheduler,
     required this.revision,
     this.diagnosticsOnly = false,
+    this.onDataChanged,
     super.key,
   });
 
@@ -4275,6 +4945,7 @@ class SettingsPage extends StatefulWidget {
   final ReminderScheduler scheduler;
   final int revision;
   final bool diagnosticsOnly;
+  final VoidCallback? onDataChanged;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -4284,6 +4955,7 @@ class _SettingsPageState extends State<SettingsPage> {
   ReminderHealth? _reminderHealth;
   int _itemCount = 0;
   int _completionCount = 0;
+  bool _backupBusy = false;
 
   @override
   void initState() {
@@ -4372,6 +5044,84 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     );
     if (mounted) await _load();
+  }
+
+  Future<void> _exportBackup() async {
+    if (_backupBusy) return;
+    setState(() => _backupBusy = true);
+    try {
+      final content = await widget.store.exportBackup();
+      final saved = await DeviceBridge.exportFile(content);
+      if (saved && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('备份已导出，包含安排版本、备注和逐次记录')));
+      }
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('导出失败，请重试')));
+      }
+    } finally {
+      if (mounted) setState(() => _backupBusy = false);
+    }
+  }
+
+  Future<void> _importBackup() async {
+    if (_backupBusy) return;
+    setState(() => _backupBusy = true);
+    try {
+      final content = await DeviceBridge.importFile();
+      if (content == null || !mounted) return;
+      final preview = DailyBackup.parse(content);
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('恢复备份'),
+          content: Text(
+            '备份包含 ${preview.items.length} 个事项、${preview.recordCount} 条逐次记录。\n\n恢复将替换本机现有数据。请先导出当前数据以便保留。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('恢复备份'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+      await widget.store.importBackup(content);
+      widget.onDataChanged?.call();
+      if (!mounted) return;
+      await DailyThemeScope.maybeOf(context)?.select(preview.theme);
+      await widget.scheduler.sync(await widget.store.loadItems());
+      await DeviceBridge.updateWidget(widget.store);
+      await _load();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('备份已恢复，提醒和小组件已更新')));
+      }
+    } on FormatException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('恢复失败，请检查备份后重试')));
+      }
+    } finally {
+      if (mounted) setState(() => _backupBusy = false);
+    }
   }
 
   Future<void> _showLocalData() => showModalBottomSheet<void>(
@@ -4472,12 +5222,57 @@ class _SettingsPageState extends State<SettingsPage> {
             const _EditorSectionLabel('数据'),
             const SizedBox(height: 9),
             _EditorSurface(
-              child: _SettingsRow(
-                icon: Icons.storage_rounded,
-                title: '本机数据',
-                subtitle: '$_itemCount 个事项 · $_completionCount 条完成记录',
-                onTap: _showLocalData,
+              child: Column(
+                children: [
+                  _SettingsRow(
+                    icon: Icons.file_upload_outlined,
+                    title: '导出备份',
+                    subtitle: '保存全部事项、历史记录和备注',
+                    onTap: _exportBackup,
+                  ),
+                  const Divider(indent: 50, endIndent: 16),
+                  _SettingsRow(
+                    icon: Icons.file_download_outlined,
+                    title: '导入与迁移',
+                    subtitle: '预览备份后恢复到本机',
+                    onTap: _importBackup,
+                  ),
+                  const Divider(indent: 50, endIndent: 16),
+                  _SettingsRow(
+                    icon: Icons.storage_rounded,
+                    title: '本机数据',
+                    subtitle: '$_itemCount 个事项 · $_completionCount 条完成记录',
+                    onTap: _showLocalData,
+                  ),
+                  if (_backupBusy) const LinearProgressIndicator(),
+                ],
               ),
+            ),
+            const SizedBox(height: 26),
+            const _EditorSectionLabel('桌面小组件'),
+            const SizedBox(height: 9),
+            _EditorSurface(
+              child: _SettingsRow(
+                icon: Icons.widgets_outlined,
+                title: '今日事项',
+                subtitle: '长按手机桌面添加 Daily 小组件，可查看今日进度与待办。',
+                onTap: () async {
+                  await DeviceBridge.updateWidget(widget.store);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('小组件数据已更新，请在桌面的小组件列表中添加 Daily'),
+                      ),
+                    );
+                  }
+                },
+              ),
+            ),
+            const SizedBox(height: 24),
+            Text(
+              'Daily 2.0.1',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
             ),
           ],
         ),
