@@ -151,6 +151,58 @@ void main() {
   });
 
   test(
+    'unchanged iOS schedules reuse requests and restore a missing request',
+    () async {
+      final items = await busySchedule();
+      await service.sync(items);
+      pending = [
+        for (final call in calls.where(
+          (call) => call.method == 'zonedSchedule',
+        ))
+          {
+            for (final field in ['id', 'title', 'body', 'payload'])
+              field: (call.arguments as Map)[field],
+          },
+      ];
+      expect(pending, hasLength(60));
+      calls.clear();
+      await service.sync(items);
+      expect(calls.where((call) => call.method == 'cancel'), isEmpty);
+      expect(calls.where((call) => call.method == 'zonedSchedule'), isEmpty);
+
+      final missing = pending.removeAt(0);
+      calls.clear();
+      await service.sync(items);
+      final scheduled = calls.where((call) => call.method == 'zonedSchedule');
+      expect(scheduled, hasLength(1));
+      expect((scheduled.single.arguments as Map)['id'], missing['id']);
+      expect(calls.where((call) => call.method == 'cancel'), isEmpty);
+    },
+  );
+
+  test('iOS editing an item replaces only its requests', () async {
+    final items = await busySchedule();
+    await service.sync(items);
+    pending = [
+      for (final call in calls.where((call) => call.method == 'zonedSchedule'))
+        {
+          for (final field in ['id', 'title', 'body', 'payload'])
+            field: (call.arguments as Map)[field],
+        },
+    ];
+    calls.clear();
+    await service.sync([items.first.copyWith(title: '新的名称'), ...items.skip(1)]);
+    final scheduled = calls.where((call) => call.method == 'zonedSchedule');
+    expect(scheduled, isNotEmpty);
+    expect(scheduled.length, lessThan(pending.length));
+    expect(
+      scheduled.every((call) => (call.arguments as Map)['title'] == '新的名称'),
+      isTrue,
+    );
+    expect(calls.where((call) => call.method == 'cancel'), isEmpty);
+  });
+
+  test(
     'resync preserves snoozes and counts them toward the iOS limit',
     () async {
       final items = await busySchedule();

@@ -428,16 +428,20 @@ class SqliteDailyStore extends DailyStore {
     String? key,
     DateTime? from,
     DateTime? to,
+    int? itemId,
   }) async {
     final where = [
       'kind = ?',
       if (key != null) 'entry_key = ?',
+      if (itemId != null) 'entry_key >= ? AND entry_key < ?',
       if (from != null) 'substr(entry_key, -10) >= ?',
       if (to != null) 'substr(entry_key, -10) <= ?',
     ].join(' AND ');
     final args = <Object>[
       kind,
       ?key,
+      if (itemId != null) '$itemId:',
+      if (itemId != null) '$itemId;',
       if (from != null) dayKey(from),
       if (to != null) dayKey(to),
     ];
@@ -460,6 +464,7 @@ class SqliteDailyStore extends DailyStore {
     bool onlyIfAbsent = false,
     bool onlyIfPending = false,
   }) async {
+    final batch = db.batch();
     for (final entry in entries.entries) {
       if (onlyIfPending) {
         final current = await db.query(
@@ -473,7 +478,7 @@ class SqliteDailyStore extends DailyStore {
           continue;
         }
       }
-      await db.insert(
+      batch.insert(
         'journal',
         {'kind': kind, 'entry_key': entry.key, 'data': jsonEncode(entry.value)},
         conflictAlgorithm: onlyIfAbsent
@@ -481,6 +486,9 @@ class SqliteDailyStore extends DailyStore {
             : ConflictAlgorithm.replace,
       );
     }
+    // Reconciliation may create months of records. Send them to SQLite in one
+    // batch rather than awaiting one platform-channel round trip per record.
+    await batch.commit(noResult: true);
   }
 
   @override
@@ -490,6 +498,14 @@ class SqliteDailyStore extends DailyStore {
     DateTime? from,
     DateTime? to,
   }) async => _readJournal(await database, kind, key: key, from: from, to: to);
+
+  @override
+  Future<List<OccurrenceRecord>> loadRecordsForItem(int itemId) async =>
+      (await _readJournal(
+        await database,
+        'records',
+        itemId: itemId,
+      )).values.map(OccurrenceRecord.fromJson).toList();
   @override
   Future<void> writeJournal(
     String kind,

@@ -688,13 +688,21 @@ class CalendarPage extends StatefulWidget {
   State<CalendarPage> createState() => _CalendarPageState();
 }
 
+class _CompletionWrite {
+  _CompletionWrite(this.savedAt);
+
+  DateTime? savedAt;
+  Future<void> pending = Future<void>.value();
+  int revision = 0;
+}
+
 class _CalendarPageState extends State<CalendarPage> {
   late DateTime _selectedDate;
   late DateTime _visibleMonth;
   Map<String, List<DayTaskGroup>> _historyDays = {};
   Map<String, DateTime> _completionTimes = const {};
   final Set<int> _expandedItemIds = <int>{};
-  final Set<String> _completionWrites = <String>{};
+  final Map<String, _CompletionWrite> _completionWrites = {};
   final Map<String, DateTime> _completionBlockedUntil = <String, DateTime>{};
   bool _loading = true;
   int _loadVersion = 0;
@@ -736,11 +744,39 @@ class _CalendarPageState extends State<CalendarPage> {
     ];
     if (!mounted || version != _loadVersion) return;
     setState(() {
+      // A refresh can finish while writes are queued. Preserve each optimistic
+      // record and its inventory until the queue reaches durable storage.
+      final pendingItems = {
+        for (final key in _completionWrites.keys)
+          int.parse(key.split(':').first),
+      };
+      final cachedDays = _historyDays;
+      for (final groups in loadedDays.values) {
+        for (var index = 0; index < groups.length; index++) {
+          final group = groups[index];
+          if (!pendingItems.contains(group.item.id)) continue;
+          final cached = (cachedDays[dayKey(group.date)] ?? <DayTaskGroup>[])
+              .where((entry) => entry.item.id == group.item.id)
+              .firstOrNull;
+          if (cached == null) continue;
+          groups[index] = DayTaskGroup(
+            item: group.item.copyWith(usedQuantity: cached.item.usedQuantity),
+            date: group.date,
+            completedKeys: group.completedKeys,
+            completionTimes: group.completionTimes,
+            records: {
+              ...group.records,
+              for (final key in _completionWrites.keys)
+                if (cached.records[key] != null) key: cached.records[key]!,
+            },
+          );
+        }
+      }
       _historyDays = loadedDays;
       final completions = Map<String, DateTime>.from(
         results[1] as Map<String, DateTime>,
       );
-      for (final key in _completionWrites) {
+      for (final key in _completionWrites.keys) {
         final timestamp = _completionTimes[key];
         if (timestamp == null) {
           completions.remove(key);
@@ -819,18 +855,23 @@ class _CalendarPageState extends State<CalendarPage> {
     }
     final key = completionKey(itemId, timeId, occurrenceDate);
     final now = DateTime.now();
-    if (_completionWrites.contains(key)) return;
     final blockedUntil = _completionBlockedUntil[key];
     if (!bypassDebounce && blockedUntil != null && blockedUntil.isAfter(now)) {
       return;
     }
     final previousCompletedAt = _completionTimes[key];
     final nextValue = completed ?? previousCompletedAt == null;
+    final write = _completionWrites.putIfAbsent(
+      key,
+      () => _CompletionWrite(previousCompletedAt),
+    );
+    final revision = ++write.revision;
     // Undo may refer to a date outside the currently loaded calendar range.
     // Its absence from the visible cache does not mean it is absent on disk.
     _loadVersion++;
-    _completionWrites.add(key);
-    _completionBlockedUntil[key] = now.add(const Duration(milliseconds: 550));
+    // Filter accidental double taps without locking the control for an animation
+    // or a database write. Deliberate reversals are queued in tap order.
+    _completionBlockedUntil[key] = now.add(const Duration(milliseconds: 120));
     setState(() {
       final nextTimes = Map<String, DateTime>.from(_completionTimes);
       if (nextValue) {
@@ -839,8 +880,13 @@ class _CalendarPageState extends State<CalendarPage> {
         nextTimes.remove(key);
       }
       _completionTimes = nextTimes;
+      _cacheCompletion(group, time, nextValue, now);
     });
-    try {
+    final updatedGroup = (_historyDays[dayKey(group.date)] ?? <DayTaskGroup>[])
+        .where((entry) => entry.item.id == group.item.id)
+        .firstOrNull;
+    HapticFeedback.selectionClick();
+    final pending = write.pending.catchError((Object _) {}).then((_) async {
       await widget.store.setCompletion(
         itemId: itemId,
         reminderTimeId: timeId,
@@ -848,11 +894,15 @@ class _CalendarPageState extends State<CalendarPage> {
         completed: nextValue,
         completedAt: nextValue ? now : null,
       );
-      if (mounted) _cacheCompletion(group, time, nextValue, now);
-      (widget.onCompletionChanged ?? widget.onDataChanged)();
+      write.savedAt = nextValue ? now : null;
+    });
+    write.pending = pending;
+    try {
+      await pending;
+      if (revision != write.revision) return;
       _completionWrites.remove(key);
+      (widget.onCompletionChanged ?? widget.onDataChanged)();
       if (!mounted) return;
-      HapticFeedback.selectionClick();
       final messenger = ScaffoldMessenger.of(context);
       messenger.hideCurrentSnackBar();
       if (nextValue && showUndo) {
@@ -866,7 +916,7 @@ class _CalendarPageState extends State<CalendarPage> {
             action: SnackBarAction(
               label: '撤销',
               onPressed: () => _setCompletionValue(
-                group,
+                updatedGroup ?? group,
                 time,
                 completed: false,
                 showUndo: false,
@@ -884,17 +934,25 @@ class _CalendarPageState extends State<CalendarPage> {
         );
       }
     } on Object {
+      if (revision != write.revision) return;
       _completionWrites.remove(key);
       if (!mounted) return;
       setState(() {
         final rollback = Map<String, DateTime>.from(_completionTimes);
-        if (previousCompletedAt == null) {
+        if (write.savedAt == null) {
           rollback.remove(key);
         } else {
-          rollback[key] = previousCompletedAt;
+          rollback[key] = write.savedAt!;
         }
         _completionTimes = rollback;
+        _cacheCompletion(
+          group,
+          time,
+          write.savedAt != null,
+          write.savedAt ?? now,
+        );
       });
+      (widget.onCompletionChanged ?? widget.onDataChanged)();
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('未能保存完成状态，请再试一次')));
@@ -908,7 +966,11 @@ class _CalendarPageState extends State<CalendarPage> {
     DateTime now,
   ) {
     final key = completionKey(group.item.id!, time.id!, group.date);
+    final cachedGroup = (_historyDays[dayKey(group.date)] ?? <DayTaskGroup>[])
+        .where((cached) => cached.item.id == group.item.id)
+        .firstOrNull;
     final original =
+        cachedGroup?.recordFor(time) ??
         group.recordFor(time) ??
         OccurrenceRecord(
           item: group.item,
@@ -917,52 +979,43 @@ class _CalendarPageState extends State<CalendarPage> {
           status: OccurrenceStatus.pending,
           changedAt: now,
         );
-    final quantity = completed
-        ? (original.item.stockQuantity == null
-              ? 0.0
-              : original.item.doseQuantity)
-        : (original.quantityUsed != 0
-              ? original.quantityUsed
-              : original.item.stockQuantity == null
-              ? 0.0
-              : original.item.doseQuantity);
+    final quantity = completed && original.item.stockQuantity != null
+        ? original.item.doseQuantity
+        : 0.0;
+    final quantityDelta = quantity - original.quantityUsed;
+    final today = dateOnly(DateTime.now());
     final record = original.copyWith(
       status: completed
           ? OccurrenceStatus.completed
-          : group.date.isBefore(dateOnly(now))
+          : group.date.isBefore(today)
           ? OccurrenceStatus.missed
           : OccurrenceStatus.pending,
       changedAt: now,
-      quantityUsed: completed ? quantity : 0,
+      quantityUsed: quantity,
     );
     final completedKeys = _completionTimes.keys.toSet();
-    final today = dateOnly(now);
-    setState(() {
-      _historyDays = {
-        for (final entry in _historyDays.entries)
-          entry.key: [
-            for (final cached in entry.value)
-              if (cached.item.id != group.item.id)
-                cached
-              else
-                DayTaskGroup(
-                  item: cached.date.isBefore(today)
-                      ? cached.item
-                      : cached.item.copyWith(
-                          usedQuantity:
-                              cached.item.usedQuantity +
-                              (completed ? quantity : -quantity),
-                        ),
-                  date: cached.date,
-                  completedKeys: completedKeys,
-                  completionTimes: _completionTimes,
-                  records: dayKey(cached.date) == dayKey(group.date)
-                      ? {...cached.records, key: record}
-                      : cached.records,
-                ),
-          ],
-      };
-    });
+    _historyDays = {
+      for (final entry in _historyDays.entries)
+        entry.key: [
+          for (final cached in entry.value)
+            if (cached.item.id != group.item.id)
+              cached
+            else
+              DayTaskGroup(
+                item: cached.date.isBefore(today)
+                    ? cached.item
+                    : cached.item.copyWith(
+                        usedQuantity: cached.item.usedQuantity + quantityDelta,
+                      ),
+                date: cached.date,
+                completedKeys: completedKeys,
+                completionTimes: _completionTimes,
+                records: dayKey(cached.date) == dayKey(group.date)
+                    ? {...cached.records, key: record}
+                    : cached.records,
+              ),
+        ],
+    };
   }
 
   Future<void> _openDetails(ReminderItem item) async {
@@ -1552,18 +1605,25 @@ class CalendarDates extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final target = expanded ? 1.0 : 0.0;
+    // Reuse day cells throughout the expansion. Status calculation can scan
+    // every occurrence in a day; it must not run on every animation tick.
+    final weeks = <int, Widget>{};
     if (MediaQuery.disableAnimationsOf(context)) {
-      return _buildDates(context, target);
+      return _buildDates(context, target, weeks);
     }
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: target, end: target),
       duration: const Duration(milliseconds: 320),
       curve: Curves.easeInOutCubic,
-      builder: (context, progress, _) => _buildDates(context, progress),
+      builder: (context, progress, _) => _buildDates(context, progress, weeks),
     );
   }
 
-  Widget _buildDates(BuildContext context, double progress) {
+  Widget _buildDates(
+    BuildContext context,
+    double progress,
+    Map<int, Widget> weeks,
+  ) {
     const labels = ['日', '一', '二', '三', '四', '五', '六'];
     const rowHeight = 52.0;
     final first = DateTime(visibleMonth.year, visibleMonth.month);
@@ -1613,19 +1673,22 @@ class CalendarDates extends StatelessWidget {
                               row != selectedRow && (!expanded || progress < 1),
                           child: Opacity(
                             opacity: row == selectedRow ? 1 : otherRowsOpacity,
-                            child: Row(
-                              children: [
-                                for (var column = 0; column < 7; column++)
-                                  Expanded(
-                                    child: _dayCell(
-                                      DateTime(
-                                        gridStart.year,
-                                        gridStart.month,
-                                        gridStart.day + row * 7 + column,
+                            child: weeks.putIfAbsent(
+                              row,
+                              () => Row(
+                                children: [
+                                  for (var column = 0; column < 7; column++)
+                                    Expanded(
+                                      child: _dayCell(
+                                        DateTime(
+                                          gridStart.year,
+                                          gridStart.month,
+                                          gridStart.day + row * 7 + column,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                              ],
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -5270,7 +5333,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 24),
             Text(
-              'Daily 2.0.1',
+              'Daily 2.0.2',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodySmall,
             ),

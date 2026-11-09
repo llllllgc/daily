@@ -365,6 +365,12 @@ abstract class DailyStore {
     bool onlyIfAbsent = false,
     bool onlyIfPending = false,
   });
+
+  Future<List<OccurrenceRecord>> loadRecordsForItem(int itemId) async =>
+      (await loadJournal('records')).values
+          .where((raw) => (raw['item'] as Map)['id'] == itemId)
+          .map(OccurrenceRecord.fromJson)
+          .toList();
   Future<String> exportBackup();
   Future<void> importBackup(String source);
   DailyHistory get history => DailyHistory(this);

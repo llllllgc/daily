@@ -179,6 +179,39 @@ bool pauseCoversDate(Map<String, Object?> pause, int itemId, DateTime date) {
       (resumed == null || day.compareTo(resumed) < 0);
 }
 
+/// A query-local index: decode each plan once and search only that item's dates.
+/// Rebuilding it per query keeps edits, imports and background writes visible.
+class _PlanVersionIndex {
+  _PlanVersionIndex(Iterable<Map<String, Object?>> versions) {
+    for (final raw in versions) {
+      final item = itemFromJson(Map<String, Object?>.from(raw['item'] as Map));
+      (_byItem[item.id!] ??= []).add((from: raw['from'] as String, item: item));
+    }
+    for (final entries in _byItem.values) {
+      entries.sort((a, b) => a.from.compareTo(b.from));
+    }
+  }
+
+  final Map<int, List<({String from, ReminderItem item})>> _byItem = {};
+  Iterable<int> get ids => _byItem.keys;
+
+  ReminderItem? itemAt(int id, String day) {
+    final entries = _byItem[id];
+    if (entries == null) return null;
+    var low = 0;
+    var high = entries.length;
+    while (low < high) {
+      final middle = (low + high) ~/ 2;
+      if (entries[middle].from.compareTo(day) <= 0) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    return low == 0 ? null : entries[low - 1].item;
+  }
+}
+
 class DailyHistory {
   DailyHistory(this.store);
   final DailyStore store;
@@ -186,7 +219,11 @@ class DailyHistory {
   Future<void> ensureVersions() async {
     final versions = await store.loadJournal('versions');
     final changes = <String, Map<String, Object?>>{};
+    final existingIds = {
+      for (final version in versions.values) (version['item'] as Map)['id'],
+    };
     for (final item in await store.loadItems(includeArchived: true)) {
+      if (existingIds.contains(item.id)) continue;
       changes.addAll(planVersionChanges(versions, null, item));
     }
     if (changes.isNotEmpty) await store.writeJournal('versions', changes);
@@ -259,17 +296,15 @@ class DailyHistory {
     }
     final pauses = await store.loadJournal('pauses');
     final completions = await store.loadCompletionTimes(from, today);
-    final ids = versions.values
-        .map((entry) => (entry['item'] as Map)['id'] as int)
-        .toSet();
+    final plans = _PlanVersionIndex(versions.values);
     final pending = <String, Map<String, Object?>>{};
     for (
       ;
       from.isBefore(today);
       from = DateTime(from.year, from.month, from.day + 1)
     ) {
-      for (final id in ids) {
-        final item = _versionFor(versions.values, id, from);
+      for (final id in plans.ids) {
+        final item = plans.itemAt(id, dayKey(from));
         if (item == null || !item.isScheduledOn(from)) continue;
         for (final time in item.times) {
           final key = completionKey(id, time.id!, from);
@@ -350,6 +385,7 @@ class DailyHistory {
     await reconcile(now: now);
     final today = dateOnly(now ?? DateTime.now());
     final versions = await store.loadJournal('versions');
+    final plans = _PlanVersionIndex(versions.values);
     final stored = await store.loadJournal('records', from: from, to: to);
     final pauses = await store.loadJournal('pauses');
     final completions = await store.loadCompletionTimes(from, to);
@@ -357,9 +393,6 @@ class DailyHistory {
       for (final item in await store.loadItems(includeArchived: true))
         item.id!: item,
     };
-    final ids = versions.values
-        .map((entry) => (entry['item'] as Map)['id'] as int)
-        .toSet();
     final recordsByDay = <String, Map<int, Map<String, OccurrenceRecord>>>{};
     for (final raw in stored.values) {
       final record = OccurrenceRecord.fromJson(raw);
@@ -376,8 +409,8 @@ class DailyHistory {
     ) {
       final day = dayKey(date);
       final groups = <DayTaskGroup>[];
-      for (final id in ids) {
-        var item = _versionFor(versions.values, id, date);
+      for (final id in plans.ids) {
+        var item = plans.itemAt(id, day);
         final dayRecords = Map<String, OccurrenceRecord>.from(
           recordsByDay[day]?[id] ?? const {},
         );
@@ -640,14 +673,20 @@ class DailyHistory {
   }
 
   Future<List<OccurrenceRecord>> recordsFor(int itemId) async {
-    await reconcile();
-    await loadDay(DateTime.now());
-    final records = (await store.loadJournal('records')).values
-        .map(OccurrenceRecord.fromJson)
-        .where((r) => r.item.id == itemId)
-        .toList();
+    return (await loadItemHistory(itemId)).records;
+  }
+
+  Future<({List<OccurrenceRecord> records, List<DayTaskGroup> today})>
+  loadItemHistory(int itemId) async {
+    // loadDay already reconciles history. Share its result with the detail
+    // page instead of loading and reconciling the same day three times.
+    final today = await loadDay(DateTime.now());
+    final records = await store.loadRecordsForItem(itemId);
     records.sort((a, b) => b.scheduledAt.compareTo(a.scheduledAt));
-    return records;
+    return (
+      records: records,
+      today: today.where((group) => group.item.id == itemId).toList(),
+    );
   }
 }
 

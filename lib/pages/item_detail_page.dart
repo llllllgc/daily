@@ -35,16 +35,15 @@ class _ItemDetailPageState extends State<ItemDetailPage> {
 
   Future<void> _load() async {
     final items = await widget.store.loadItems(includeArchived: true);
-    final list = await widget.store.history.recordsFor(item.id!);
-    final groups = await widget.store.history.loadDay(DateTime.now());
+    final history = await widget.store.history.loadItemHistory(item.id!);
     final pauseList = (await widget.store.loadJournal(
       'pauses',
     )).values.where((p) => p['itemId'] == item.id).toList();
     if (!mounted) return;
     setState(() {
       item = items.where((i) => i.id == item.id).firstOrNull ?? item;
-      records = list;
-      today = groups.where((g) => g.item.id == item.id).toList();
+      records = history.records;
+      today = history.today;
       pauses = pauseList;
       loading = false;
     });

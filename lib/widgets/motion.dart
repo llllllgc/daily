@@ -12,7 +12,7 @@ Duration appMotion(BuildContext context, int milliseconds) =>
 
 /// Reveals the completed surface from left to right and retracts it on undo.
 /// The child stays above the fill, so labels and controls remain readable.
-class CompletionFillSurface extends StatelessWidget {
+class CompletionFillSurface extends StatefulWidget {
   const CompletionFillSurface({
     required this.completed,
     required this.baseColor,
@@ -29,32 +29,89 @@ class CompletionFillSurface extends StatelessWidget {
   final Widget child;
 
   @override
+  State<CompletionFillSurface> createState() => _CompletionFillSurfaceState();
+}
+
+class _CompletionFillSurfaceState extends State<CompletionFillSurface>
+    with SingleTickerProviderStateMixin {
+  late final _progress = AnimationController(
+    vsync: this,
+    value: widget.completed ? 1 : 0,
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _progress.value = widget.completed ? 1 : 0;
+    }
+  }
+
+  @override
+  void didUpdateWidget(CompletionFillSurface oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.completed == widget.completed) return;
+    final target = widget.completed ? 1.0 : 0.0;
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _progress.value = target;
+    } else {
+      _progress.animateTo(
+        target,
+        duration: Duration(milliseconds: widget.completed ? 320 : 240),
+        curve: Curves.easeInOutCubic,
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _progress.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) => ClipRRect(
-    borderRadius: borderRadius,
-    child: TweenAnimationBuilder<double>(
-      tween: Tween(begin: completed ? 1.0 : 0.0, end: completed ? 1.0 : 0.0),
-      duration: appMotion(context, completed ? 320 : 240),
-      curve: Curves.easeInOutCubic,
-      child: child,
-      builder: (context, progress, child) => Stack(
-        children: [
-          Positioned.fill(child: ColoredBox(color: baseColor)),
-          Positioned.fill(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: FractionallySizedBox(
-                key: const Key('completion-fill'),
-                widthFactor: progress,
-                heightFactor: 1,
-                child: ColoredBox(color: completedColor),
-              ),
-            ),
-          ),
-          ?child,
-        ],
+    borderRadius: widget.borderRadius,
+    child: CustomPaint(
+      key: const Key('completion-fill'),
+      painter: CompletionFillPainter(
+        progress: _progress,
+        baseColor: widget.baseColor,
+        completedColor: widget.completedColor,
       ),
+      child: RepaintBoundary(child: widget.child),
     ),
   );
+}
+
+/// Drives only paint: filling a card must not rebuild or lay out its contents.
+class CompletionFillPainter extends CustomPainter {
+  CompletionFillPainter({
+    required this.progress,
+    required this.baseColor,
+    required this.completedColor,
+  }) : super(repaint: progress);
+
+  final Animation<double> progress;
+  final Color baseColor;
+  final Color completedColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(Offset.zero & size, Paint()..color = baseColor);
+    if (progress.value > 0) {
+      canvas.drawRect(
+        Rect.fromLTWH(0, 0, size.width * progress.value, size.height),
+        Paint()..color = completedColor,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(CompletionFillPainter oldDelegate) =>
+      progress != oldDelegate.progress ||
+      baseColor != oldDelegate.baseColor ||
+      completedColor != oldDelegate.completedColor;
 }
 
 /// Moves the current calendar with the finger and settles into the next period.
@@ -79,6 +136,13 @@ class _SwipePeriodState extends State<SwipePeriod>
   late final _slide = AnimationController.unbounded(vsync: this);
   double _width = 1;
   int _gestureVersion = 0;
+  final Map<int, Widget> _adjacentCalendars = {};
+
+  @override
+  void didUpdateWidget(SwipePeriod oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _adjacentCalendars.clear();
+  }
 
   Future<void> _settle(int delta) async {
     final version = ++_gestureVersion;
@@ -120,6 +184,7 @@ class _SwipePeriodState extends State<SwipePeriod>
         onHorizontalDragStart: (_) {
           _gestureVersion++;
           _slide.stop();
+          _adjacentCalendars.clear();
         },
         onHorizontalDragUpdate: (details) {
           _slide.value = (_slide.value + (details.primaryDelta ?? 0)).clamp(
@@ -151,7 +216,10 @@ class _SwipePeriodState extends State<SwipePeriod>
                       width: _width,
                       child: IgnorePointer(
                         child: ExcludeSemantics(
-                          child: widget.adjacentBuilder(offset < 0 ? 1 : -1),
+                          child: _adjacentCalendars.putIfAbsent(
+                            offset < 0 ? 1 : -1,
+                            () => widget.adjacentBuilder(offset < 0 ? 1 : -1),
+                          ),
                         ),
                       ),
                     ),

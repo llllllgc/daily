@@ -378,6 +378,7 @@ class NotificationService implements ReminderScheduler {
   bool _initialized = false;
   DateTime? _lastSyncedAt;
   Future<void> _syncQueue = Future<void>.value();
+  final Map<int, String> _iosScheduled = {};
 
   static bool get _isIOS => defaultTargetPlatform == TargetPlatform.iOS;
   static bool get _isAndroid => defaultTargetPlatform == TargetPlatform.android;
@@ -828,6 +829,7 @@ class NotificationService implements ReminderScheduler {
     await initialize();
     final pending = await _plugin.pendingNotificationRequests();
     var snoozedCount = 0;
+    final keptSnoozes = <int>{};
     for (final notification in pending) {
       final payload = NotificationPayload.decode(notification.payload);
       final keepSnooze =
@@ -842,8 +844,7 @@ class NotificationService implements ReminderScheduler {
               ));
       if (keepSnooze) {
         snoozedCount++;
-      } else {
-        await _plugin.cancel(id: notification.id);
+        keptSnoozes.add(notification.id);
       }
     }
 
@@ -900,7 +901,34 @@ class NotificationService implements ReminderScheduler {
     // iOS retains at most 64 pending requests. Leave room for snoozes and
     // include cycle alerts in the same budget so they cannot evict reminders.
     final limit = _isIOS ? (64 - snoozedCount).clamp(0, 60) : 96;
-    for (final notification in schedule.take(limit)) {
+    final desired = schedule.take(limit).toList(growable: false);
+    final desiredIds = desired.map((notification) => notification.id).toSet();
+    final pendingById = {for (final request in pending) request.id: request};
+    for (final request in pending) {
+      if (!keptSnoozes.contains(request.id) &&
+          !desiredIds.contains(request.id)) {
+        await _plugin.cancel(id: request.id);
+      }
+    }
+    _iosScheduled.removeWhere((id, _) => !desiredIds.contains(id));
+    for (final notification in desired) {
+      final signature = jsonEncode([
+        notification.title,
+        notification.body,
+        notification.date.toIso8601String(),
+        tz.local.name,
+        notification.payload,
+      ]);
+      final existing = pendingById[notification.id];
+      // Only reuse requests verified in this process and still present in iOS.
+      // A fresh launch or a missing request always schedules it again.
+      if (_iosScheduled[notification.id] == signature &&
+          existing != null &&
+          existing.title == notification.title &&
+          existing.body == notification.body &&
+          (existing.payload ?? '') == (notification.payload ?? '')) {
+        continue;
+      }
       await _plugin.zonedSchedule(
         id: notification.id,
         title: notification.title,
@@ -910,6 +938,7 @@ class NotificationService implements ReminderScheduler {
         androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
         payload: notification.payload,
       );
+      _iosScheduled[notification.id] = signature;
     }
     _lastSyncedAt = DateTime.now();
   }

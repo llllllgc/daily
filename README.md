@@ -2,7 +2,7 @@
   <img src="assets/branding/launcher-source.png" width="112" alt="Daily app icon">
 </p>
 
-<h1 align="center">Daily 2.0.1</h1>
+<h1 align="center">Daily 2.0.2</h1>
 
 <p align="center">一款安静、简洁、本地优先的 Android / iOS 日常事项提醒与记录应用。</p>
 

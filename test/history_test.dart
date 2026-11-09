@@ -44,6 +44,26 @@ void main() {
         }
         await temporary?.delete(recursive: true);
       });
+      test('item history isolates IDs with a common numeric prefix', () async {
+        final items = [
+          for (var i = 0; i < 10; i++)
+            await store.saveItem(plan(title: '事项 $i')),
+        ];
+        for (final item in [items.first, items.last]) {
+          await store.setCompletion(
+            itemId: item.id!,
+            reminderTimeId: item.times.first.id!,
+            date: today,
+            completed: true,
+          );
+        }
+        final records = await store.loadRecordsForItem(items.first.id!);
+        expect(records, hasLength(1));
+        expect(records.single.item.id, items.first.id);
+        expect(records.single.status, OccurrenceStatus.completed);
+        expect(await store.loadRecordsForItem(999), isEmpty);
+      });
+
       test(
         'changing schedule and removing a time preserves past plans and quantities',
         () async {

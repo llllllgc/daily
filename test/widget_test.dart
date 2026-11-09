@@ -5,7 +5,8 @@ import 'package:daily/models.dart';
 import 'package:daily/services/notification_service.dart';
 import 'package:daily/widgets/completion_progress_ring.dart';
 import 'package:daily/widgets/button_origin_route.dart';
-import 'package:daily/widgets/motion.dart' show MotionPageEntrance;
+import 'package:daily/widgets/motion.dart'
+    show CompletionFillPainter, MotionPageEntrance;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -219,7 +220,7 @@ void main() {
       );
       await tester.pumpAndSettle();
     }
-    // The completion control intentionally rejects repeated taps for 550 ms.
+    // Let the progress ring and row movement finish before the next assertion.
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 560)),
     );
@@ -559,7 +560,10 @@ void main() {
       of: first,
       matching: find.byKey(const Key('completion-fill')),
     );
-    final fillProgress = tester.widget<FractionallySizedBox>(fill).widthFactor!;
+    final fillProgress =
+        (tester.widget<CustomPaint>(fill).painter! as CompletionFillPainter)
+            .progress
+            .value;
     expect(fillProgress, greaterThan(0));
     expect(fillProgress, lessThan(1));
     expect(tester.getTopLeft(first).dy, closeTo(start, 0.1));
@@ -575,9 +579,10 @@ void main() {
     tester.widget<SnackBarAction>(find.byType(SnackBarAction)).onPressed();
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 80));
-    final reverseProgress = tester
-        .widget<FractionallySizedBox>(fill)
-        .widthFactor!;
+    final reverseProgress =
+        (tester.widget<CustomPaint>(fill).painter! as CompletionFillPainter)
+            .progress
+            .value;
     expect(reverseProgress, greaterThan(0));
     expect(reverseProgress, lessThan(1));
     await tester.pumpAndSettle();
@@ -1008,7 +1013,12 @@ void main() {
       of: first,
       matching: find.byKey(const Key('completion-fill')),
     );
-    expect(tester.widget<FractionallySizedBox>(fill).widthFactor, 1);
+    expect(
+      (tester.widget<CustomPaint>(fill).painter! as CompletionFillPainter)
+          .progress
+          .value,
+      1,
+    );
   });
 
   testWidgets('rapid completion taps only complete once and undo restores it', (
