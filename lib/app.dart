@@ -381,7 +381,11 @@ class _DailyShellState extends State<DailyShell> with WidgetsBindingObserver {
   void _flushCompletionMaintenance() {
     _completionMaintenance?.cancel();
     if (!mounted) return;
-    setState(() => _revision++);
+    // The calendar already holds the saved completion. Rebuilding the shell
+    // here repeated the entire homepage build during the next interaction.
+    // The hidden items tab receives this revision when it is opened.
+    _revision++;
+    if (_selectedIndex == 1) setState(() {});
     unawaited(_syncNotifications());
   }
 
@@ -704,6 +708,8 @@ class _CalendarPageState extends State<CalendarPage> {
   final Set<int> _expandedItemIds = <int>{};
   final Map<String, _CompletionWrite> _completionWrites = {};
   final Map<String, DateTime> _completionBlockedUntil = <String, DateTime>{};
+  final Map<int, ({DayTaskGroup group, bool expanded, Widget view})>
+  _taskViews = {};
   bool _loading = true;
   int _loadVersion = 0;
   bool _monthExpanded = false;
@@ -744,6 +750,18 @@ class _CalendarPageState extends State<CalendarPage> {
     ];
     if (!mounted || version != _loadVersion) return;
     setState(() {
+      final completions = Map<String, DateTime>.from(
+        results[1] as Map<String, DateTime>,
+      );
+      for (final key in _completionWrites.keys) {
+        final timestamp = _completionTimes[key];
+        if (timestamp == null) {
+          completions.remove(key);
+        } else {
+          completions[key] = timestamp;
+        }
+      }
+      final completionKeys = completions.keys.toSet();
       // A refresh can finish while writes are queued. Preserve each optimistic
       // record and its inventory until the queue reaches durable storage.
       final pendingItems = {
@@ -762,8 +780,8 @@ class _CalendarPageState extends State<CalendarPage> {
           groups[index] = DayTaskGroup(
             item: group.item.copyWith(usedQuantity: cached.item.usedQuantity),
             date: group.date,
-            completedKeys: group.completedKeys,
-            completionTimes: group.completionTimes,
+            completedKeys: completionKeys,
+            completionTimes: completions,
             records: {
               ...group.records,
               for (final key in _completionWrites.keys)
@@ -773,17 +791,6 @@ class _CalendarPageState extends State<CalendarPage> {
         }
       }
       _historyDays = loadedDays;
-      final completions = Map<String, DateTime>.from(
-        results[1] as Map<String, DateTime>,
-      );
-      for (final key in _completionWrites.keys) {
-        final timestamp = _completionTimes[key];
-        if (timestamp == null) {
-          completions.remove(key);
-        } else {
-          completions[key] = timestamp;
-        }
-      }
       _completionTimes = completions;
       _expandedItemIds.removeWhere(
         (id) => !loadedDays.values
@@ -795,18 +802,11 @@ class _CalendarPageState extends State<CalendarPage> {
   }
 
   List<DayTaskGroup> get _groups {
-    final completionKeys = _completionTimes.keys.toSet();
-    final groups = (_historyDays[dayKey(_selectedDate)] ?? [])
-        .map(
-          (group) => DayTaskGroup(
-            item: group.item,
-            date: group.date,
-            completedKeys: completionKeys,
-            completionTimes: _completionTimes,
-            records: group.records,
-          ),
-        )
-        .toList();
+    // Keep each unchanged group's identity, including across shell maintenance.
+    // Rewrapping every group here used to invalidate every task card per tap.
+    final groups = List<DayTaskGroup>.of(
+      _historyDays[dayKey(_selectedDate)] ?? [],
+    );
     groups.sort((a, b) => a.nextMinute.compareTo(b.nextMinute));
     final originalOrder = {
       for (var index = 0; index < groups.length; index++)
@@ -998,7 +998,9 @@ class _CalendarPageState extends State<CalendarPage> {
       for (final entry in _historyDays.entries)
         entry.key: [
           for (final cached in entry.value)
-            if (cached.item.id != group.item.id)
+            if (cached.item.id != group.item.id ||
+                (cached.date != group.date &&
+                    (quantityDelta == 0 || cached.date.isBefore(today))))
               cached
             else
               DayTaskGroup(
@@ -1156,6 +1158,8 @@ class _CalendarPageState extends State<CalendarPage> {
   @override
   Widget build(BuildContext context) {
     final groups = _groups;
+    final visibleIds = groups.map((group) => group.item.id).toSet();
+    _taskViews.removeWhere((id, _) => !visibleIds.contains(id));
     final total = groups.fold<int>(
       0,
       (sum, group) => sum + group.item.times.length,
@@ -1225,31 +1229,7 @@ class _CalendarPageState extends State<CalendarPage> {
                         for (final group in groups)
                           _AnimatedOrderEntry(
                             id: group.item.id!,
-                            child: TaskGroupView(
-                              key: ValueKey<String>('group-${group.item.id}'),
-                              group: group,
-                              expanded:
-                                  group.item.times.length > 1 &&
-                                  _expandedItemIds.contains(group.item.id),
-                              onToggleExpanded: group.item.times.length > 1
-                                  ? () => setState(() {
-                                      final itemId = group.item.id!;
-                                      if (!_expandedItemIds.remove(itemId)) {
-                                        _expandedItemIds.add(itemId);
-                                      }
-                                    })
-                                  : null,
-                              onToggleCompletion: (time) =>
-                                  _toggleCompletion(group, time),
-                              onEditTime: (time) => widget.onEditTime(
-                                group.item,
-                                time,
-                                group.date,
-                              ),
-                              onOpenDetails: () => _openDetails(group.item),
-                              onOccurrenceActions: (time) =>
-                                  _occurrenceActions(group, time),
-                            ),
+                            child: _taskView(group),
                           ),
                       ],
                     ),
@@ -1260,6 +1240,34 @@ class _CalendarPageState extends State<CalendarPage> {
         ),
       ),
     );
+  }
+
+  Widget _taskView(DayTaskGroup group) {
+    final id = group.item.id!;
+    final expanded =
+        group.item.times.length > 1 && _expandedItemIds.contains(id);
+    final cached = _taskViews[id];
+    if (cached != null &&
+        identical(cached.group, group) &&
+        cached.expanded == expanded) {
+      return cached.view;
+    }
+    final view = TaskGroupView(
+      key: ValueKey<String>('group-$id'),
+      group: group,
+      expanded: expanded,
+      onToggleExpanded: group.item.times.length > 1
+          ? () => setState(() {
+              if (!_expandedItemIds.remove(id)) _expandedItemIds.add(id);
+            })
+          : null,
+      onToggleCompletion: (time) => _toggleCompletion(group, time),
+      onEditTime: (time) => widget.onEditTime(group.item, time, group.date),
+      onOpenDetails: () => _openDetails(group.item),
+      onOccurrenceActions: (time) => _occurrenceActions(group, time),
+    );
+    _taskViews[id] = (group: group, expanded: expanded, view: view);
+    return view;
   }
 }
 
@@ -1921,6 +1929,12 @@ class TaskGroupView extends StatelessWidget {
     final onlyTime = isMultiple ? null : group.item.times.single;
     final singleCompleted = onlyTime != null && group.isCompleted(onlyTime);
     final parentCompleted = isMultiple ? group.allCompleted : singleCompleted;
+    final status = onlyTime == null ? null : group.statusFor(onlyTime);
+    final showStatus = {
+      OccurrenceStatus.missed,
+      OccurrenceStatus.skipped,
+      OccurrenceStatus.paused,
+    }.contains(status);
 
     return Column(
       children: [
@@ -1963,35 +1977,41 @@ class TaskGroupView extends StatelessWidget {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Text(
-                              group.item.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.titleMedium
-                                  ?.copyWith(
-                                    color: parentCompleted
-                                        ? context.palette.muted
-                                        : context.palette.ink,
+                            Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    group.item.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(
+                                          color: parentCompleted
+                                              ? context.palette.muted
+                                              : context.palette.ink,
+                                        ),
                                   ),
+                                ),
+                                if (showStatus) ...[
+                                  const SizedBox(width: 20),
+                                  Text(
+                                    status!.label,
+                                    key: ValueKey(
+                                      'task-status-${group.item.id}',
+                                    ),
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: status == OccurrenceStatus.missed
+                                          ? context.palette.missed
+                                          : context.palette.muted,
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                             const SizedBox(height: 3),
-                            if (onlyTime != null &&
-                                {
-                                  OccurrenceStatus.missed,
-                                  OccurrenceStatus.skipped,
-                                  OccurrenceStatus.paused,
-                                }.contains(group.statusFor(onlyTime)))
-                              Text(
-                                group.statusFor(onlyTime).label,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color:
-                                      group.statusFor(onlyTime) ==
-                                          OccurrenceStatus.missed
-                                      ? context.palette.missed
-                                      : context.palette.muted,
-                                ),
-                              ),
                             if (onlyTime != null &&
                                 (group.recordFor(onlyTime)?.note.isNotEmpty ??
                                     false))
@@ -2011,6 +2031,8 @@ class TaskGroupView extends StatelessWidget {
                                 key: ValueKey<String>(
                                   'next-time-${group.item.id}',
                                 ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: Theme.of(context).textTheme.bodySmall
                                     ?.copyWith(
                                       color: parentCompleted
@@ -2049,13 +2071,11 @@ class TaskGroupView extends StatelessWidget {
                             if (inventoryLabel != null ||
                                 expiryLabel != null) ...[
                               const SizedBox(height: 4),
-                              Text(
+                              _TaskInventoryLabel(
                                 [
                                   inventoryLabel,
                                   expiryLabel,
                                 ].whereType<String>().join(' · '),
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
                                 style: Theme.of(context).textTheme.bodySmall
                                     ?.copyWith(
                                       color:
@@ -2126,6 +2146,34 @@ class TaskGroupView extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Reserve the same two text lines even when completion changes the stock label.
+class _TaskInventoryLabel extends StatelessWidget {
+  const _TaskInventoryLabel(this.text, {required this.style});
+
+  final String text;
+  final TextStyle? style;
+
+  @override
+  Widget build(BuildContext context) {
+    final painter = TextPainter(
+      text: TextSpan(text: '国\n国', style: style),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    final height = painter.height;
+    painter.dispose();
+    return SizedBox(
+      height: height,
+      child: Text(
+        text,
+        style: style,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
     );
   }
 }
